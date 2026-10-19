@@ -374,3 +374,67 @@ def test_foam_edge_cases(tmp_path):
     (tmp_path / "c/constant/polyMesh/owner").write_text("FoamFile { format ascii; }\n0\n(\n)\n")
     with pytest.raises(CfdmlError):
         foam.n_cells(tmp_path / "c")
+
+
+def test_export_and_evaluate(demo, tmp_path, capsys):
+    import json
+    from cfdml.mldata import Traj, load, save
+    from cfdml.mleval import divergence
+    o = tmp_path
+    assert main(["export", "--sweep", str(demo / "sweep.yaml"), "-f", "U", "--grid", "64", "-o", str(o / "s")]) == 0
+    split = json.loads((o / "s/split.json").read_text())
+    assert len(split["train"]) + len(split["val"]) + len(split["test"]) == 16 and not set(split["train"]) & set(split["test"])
+    assert all(load(f).names == ["Ux", "Uy"] for f in (o / "s/cases").glob("*.npz"))
+    assert main(["export", str(demo / "wake"), "-f", "U", "--after", "10", "-o", str(o / "w")]) == 0
+    w = load(o / "w/cases/wake.npz")
+    stats = json.loads((o / "w/stats.json").read_text())
+    a, b = json.loads((o / "w/split.json").read_text())["train"]
+    assert abs(stats["Ux"]["mean"] - w.flat()[a:b, :, 0].mean()) < 1e-6
+    assert main(["evaluate", str(o / "w/cases/wake.npz"), str(o / "w/cases/wake.npz"), "-o", str(o / "e0")]) == 0
+    assert "first step 0.000, mean 0.000" in capsys.readouterr().out
+    rng = np.random.default_rng(0)
+    noisy = w.fields + 0.01 * (w.fields - w.fields.mean(0)).std(axis=(0, 2, 3), keepdims=True) * rng.standard_normal(w.fields.shape) * w.mask
+    save(Traj(noisy, w.times, w.names, x=w.x, y=w.y, mask=w.mask), o / "n.npz")
+    assert main(["evaluate", str(o / "n.npz"), str(o / "w/cases/wake.npz"), "-o", str(o / "e1")]) == 0
+    assert "mean 0.010" in capsys.readouterr().out
+    x = np.linspace(0, 2 * np.pi, 128)
+    X, Y = np.meshgrid(x, x)
+    u, v = np.sin(X) * np.cos(Y), -np.cos(X) * np.sin(Y)
+    assert divergence(u, v, x[1] - x[0], x[1] - x[0]) < 1e-3
+    assert divergence(u, v + 0.5 * np.sin(Y), x[1] - x[0], x[1] - x[0]) > 0.1
+
+
+def test_rollout_and_dataset(demo, tmp_path, capsys):
+    import json
+    from cfdml.mldata import Traj, save
+    o = tmp_path
+    t = np.arange(0, 200, 0.25)
+    xg = np.linspace(0, 10, 40)
+    X, Y = np.meshgrid(xg, xg[:20])
+
+    def traj(f_of_t, amp_of_t, n):
+        ph = np.cumsum(2 * np.pi * f_of_t(t[:n]) * 0.25)
+        F = np.stack([np.stack([a * np.sin(X - p), a * np.cos(X - p) * np.exp(-Y / 5)]) for p, a in zip(ph, amp_of_t(t[:n]))])
+        return Traj(F, t[:n], ["u", "v"], x=xg, y=xg[:20], mask=np.ones(X.shape, bool), params={})
+
+    save(traj(lambda s: 0.2 + 0 * s, lambda s: 1 + 0 * s, 400), o / "truth.npz")
+    save(traj(lambda s: 0.2 - 0.04 * s / 200, lambda s: np.exp(-s / 150), 800), o / "pred.npz")
+    assert main(["rollout", str(o / "pred.npz"), "--truth", str(o / "truth.npz"), "-o", str(o / "r")]) == 0
+    out = capsys.readouterr().out
+    assert "frequency drifts" in out and "dying out" in out
+    d = o / "ds"
+    (d / "cases").mkdir(parents=True)
+    base = traj(lambda s: 0.2 + 0 * s, lambda s: 1 + 0 * s, 200)
+    for k, re_ in enumerate([100, 200, 300, 400, 500, 200]):
+        F = base.fields * (1 + re_ / 1000)
+        if k == 1:
+            F = F.copy(); F[0] += 5
+        if k == 2:
+            F = F.copy(); F[50] = F[49]
+        save(Traj(F, base.times, base.names, x=base.x, y=base.y, mask=base.mask, params={"Re": re_}),
+             d / "cases" / f"c{k}.npz")
+    (d / "split.json").write_text(json.dumps(dict(train=["c0", "c1", "c2", "c3"], val=["c4"], test=["c5"])))
+    assert main(["dataset", str(d), "-o", str(o / "a")]) == 3
+    rep = (o / "a/report.md").read_text()
+    assert "first snapshot does not follow" in rep and "repeated snapshots" in rep
+    assert "leak" in rep and "outside the training range" in rep

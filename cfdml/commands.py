@@ -1357,3 +1357,395 @@ def cmd_optimize(args):
                 ax.set_yscale("log")
         rep.figure(fig, "optimize")
     rep.close()
+
+
+def _grid_size(text):
+    if not text:
+        return None
+    a = [int(v) for v in text.lower().split("x")]
+    return (a[0], a[1]) if len(a) == 2 else (a[0], None)
+
+
+def cmd_export(args):
+    import json
+    from .mldata import GridMap, Traj, load_case, save
+    from .report import claim
+    if not args.field:
+        raise CfdmlError("say which fields to export with -f", hint="e.g.  -f U -f p")
+    cases = [(Path(c), {}) for c in args.cases or []]
+    if args.sweep:
+        cfg = load_config(args.sweep)
+        inputs, rows = collect(dict(cfg, outputs={}))
+        cases += [(r["case"], r["x"]) for r in rows if r["case"] is not None]
+    if not cases:
+        raise CfdmlError("no cases given", hint="cfdml export case1 case2 ... -f U   or   --sweep sweep.yaml")
+    out = claim(args.out or "cfdml_dataset")
+    (out / "cases").mkdir(exist_ok=True)
+    size = _grid_size(args.grid)
+    box = [float(v) for v in args.box.split(",")] if args.box else None
+    gm, gm_key, names, rows = None, None, {}, []
+    for case, params in cases:
+        after = args.after
+        if after == "auto":
+            after, _ = _transient_from_case(case)
+        elif after is not None:
+            after = float(after)
+        tr = load_case(case, args.field, after, args.before, args.every, min_times=1)
+        tr.params = params
+        if size:
+            if tr.points is None:
+                raise CfdmlError(f"{case}: no cell centres to interpolate from", hint="run  postProcess -func "
+                                 "writeCellCentres  or use --no-grid")
+            key = (len(tr.points), float(tr.points.sum()))
+            if gm is None or key != gm_key:
+                a, b = np.argsort(np.ptp(tr.points, 0))[::-1][:2]
+                span = np.ptp(tr.points[:, [a, b]], 0) if not box else np.array([box[1] - box[0], box[3] - box[2]])
+                nx, ny = size[0], size[1] or max(8, int(round(size[0] * span[1] / span[0])))
+                gm, gm_key = GridMap(tr.points, nx, ny, box), key
+            F = np.stack([gm(f) for f in tr.fields]).transpose(0, 3, 1, 2)
+            tr = Traj(F, tr.times, tr.names, x=gm.x, y=gm.y, mask=gm.mask, params=params, source=str(case))
+        name = case.name
+        while name in names:
+            name += "_"
+        names[name] = tr
+        save(tr, out / "cases" / f"{name}.npz")
+        rows.append([name, len(tr.times), fmt(tr.times[0]), fmt(tr.times[-1]), " ".join(f"{k}={fmt(v)}" for k, v in params.items())])
+        print(f"  {name}: {len(tr.times)} snapshots, {tr.fields.shape[1:]} -> cases/{name}.npz")
+    rng = np.random.default_rng(args.seed)
+    fr = [float(v) for v in args.split.split(",")]
+    order = list(names)
+    rng.shuffle(order)
+    split = {}
+    if len(order) >= 3:
+        n_val = max(1, int(round(fr[1] * len(order))))
+        n_test = max(1, int(round(fr[2] * len(order))))
+        split = dict(test=sorted(order[:n_test]), val=sorted(order[n_test:n_test + n_val]),
+                     train=sorted(order[n_test + n_val:]))
+        if not split["train"]:
+            raise CfdmlError("the split leaves no training cases", hint="give more cases or change --split")
+    else:
+        T = len(next(iter(names.values())).times)
+        a, b = int(fr[0] * T), int((fr[0] + fr[1]) * T)
+        gap = max(1, T // 50)
+        split = dict(by_time=True, train=[0, a], val=[a + gap, b], test=[b + gap, T])
+        print("  fewer than 3 cases: split by time inside each case (train, then val, then test, with a small gap); "
+              "this tests extrapolation in time, not generalisation to new cases")
+    train = split["train"] if not split.get("by_time") else list(names)
+    X = np.concatenate([names[n].flat().reshape(-1, len(names[n].names)) if not split.get("by_time") else
+                        names[n].flat()[split["train"][0]:split["train"][1]].reshape(-1, len(names[n].names))
+                        for n in train])
+    chans = next(iter(names.values())).names
+    stats = {c: dict(mean=float(X[:, i].mean()), std=float(X[:, i].std()), min=float(X[:, i].min()), max=float(X[:, i].max()))
+             for i, c in enumerate(chans)}
+    (out / "split.json").write_text(json.dumps(split, indent=1))
+    (out / "stats.json").write_text(json.dumps(stats, indent=1))
+    first = next(iter(names.values()))
+    meta = dict(fields=args.field, channels=chans, grid=list(first.fields.shape[2:]) if first.grid else None,
+                layout="(T, C, H, W)" if first.grid else "(T, N, C)",
+                dt=float(np.median(np.diff(first.times))) if len(first.times) > 1 else None,
+                cases=len(names), source=[str(c) for c, _ in cases], made_by="cfdml export")
+    (out / "meta.json").write_text(json.dumps(meta, indent=1))
+    rep = Report(out, "Dataset export")
+    rep.say(f"{len(names)} cases, channels {', '.join(chans)}, layout {meta['layout']}"
+            + (f", grid {meta['grid'][1]} x {meta['grid'][0]}" if first.grid else ""), summary=True)
+    rep.say(("split by time: " if split.get("by_time") else "split by case: ")
+            + ", ".join(f"{k} {len(v) if not split.get('by_time') else v}" for k, v in split.items() if k != "by_time"),
+            summary=True)
+    rep.say("normalisation statistics in `stats.json` come from the training part only")
+    rep.table(["case", "snapshots", "from", "to", "inputs"], rows)
+    rep.lines += ["", "Load a case in Python:", "", "```python", "import numpy as np",
+                  "z = np.load('cases/<name>.npz')", "x = z['fields']   # " + meta["layout"], "```", ""]
+    rep.close()
+
+
+def _field_image(ax, traj, values, title, cmap="RdBu_r", sym=True):
+    if traj.grid:
+        v = np.ma.masked_where(~traj.mask, values) if traj.mask is not None else values
+        lim = np.nanmax(np.abs(v)) if sym else None
+        ext = [traj.x[0], traj.x[-1], traj.y[0], traj.y[-1]] if traj.x is not None else None
+        im = ax.imshow(v, origin="lower", cmap=cmap, vmin=-lim if sym else None, vmax=lim if sym else None,
+                       extent=ext, interpolation="bilinear")
+        ax.set_facecolor("#3b3b3b")
+    elif traj.points is not None:
+        a, b = np.argsort(np.ptp(traj.points, 0))[::-1][:2]
+        lim = np.max(np.abs(values)) if sym else None
+        im = ax.tricontourf(traj.points[:, a], traj.points[:, b], values, levels=40, cmap=cmap,
+                            vmin=-lim if sym else None, vmax=lim if sym else None)
+        ax.set_aspect("equal")
+    else:
+        return None
+    ax.set_title(title, fontsize=8); ax.set_xticks([]); ax.set_yticks([]); ax.grid(False)
+    return im
+
+
+def cmd_evaluate(args):
+    from .mldata import load
+    from .mleval import align, divergence, ke_spectrum, rel_l2, velocity_channels
+    P, T = load(args.pred, args.field), load(args.truth, args.field)
+    n = align(P, T)
+    if args.steps:
+        n = min(n, args.steps)
+    t = T.times[:n]
+    Pf, Tf = P.flat()[:n], T.flat()[:n]
+    if not np.isfinite(Pf).all():
+        bad = int(np.argmax(~np.isfinite(Pf).reshape(n, -1).all(1)))
+        print(f"  warning: the prediction has NaN/inf from step {bad}; metrics use the steps before it")
+        n = max(bad, 1)
+        t, Pf, Tf = t[:n], Pf[:n], Tf[:n]
+    rep = Report(_out(args, "cfdml_evaluate"), f"Prediction vs truth: {Path(args.pred).name}")
+    rep.say(f"{n} common snapshots, t = {fmt(t[0])} to {fmt(t[-1])}; channels {', '.join(T.names)}")
+    E = np.stack([rel_l2(Pf[:, :, i], Tf[:, :, i]) for i in range(len(T.names))], 1)
+    overall = rel_l2(Pf.reshape(n, -1), Tf.reshape(n, -1))
+    rows = []
+    for i, c in enumerate(T.names):
+        e = E[:, i]
+        cross = np.nonzero(e > 0.5)[0]
+        rows.append([c, f"{e[0]:.3f}", f"{e[min(n - 1, max(1, n // 10))]:.3f}", f"{e.mean():.3f}", f"{e[-1]:.3f}",
+                     fmt(t[cross[0]]) if cross.size else "never"])
+    rep.table(["channel", "first step", "after 10%", "mean", "last", "error passes 0.5 at t ="], rows)
+    rep.say("errors are relative L2: ||pred - truth|| / ||truth - its time mean||, per snapshot (1 = as bad as "
+            "predicting the mean flow)")
+    rep.say(f"overall relative L2: first step {overall[0]:.3f}, mean {overall.mean():.3f}, last {overall[-1]:.3f}",
+            summary=True)
+    cross = np.nonzero(overall > 0.5)[0]
+    if cross.size:
+        rep.say(f"the error passes 0.5 at t = {fmt(t[cross[0]])} ({cross[0]} steps)", summary=True)
+    mP, mT = Pf.mean(0), Tf.mean(0)
+    sP, sT = Pf.std(0), Tf.std(0)
+    em = np.linalg.norm(mP - mT) / max(np.linalg.norm(mT - mT.mean(0)), 1e-30)
+    es = np.linalg.norm(sP - sT) / max(np.linalg.norm(sT), 1e-30)
+    rep.say(f"statistics: time-mean field error {em:.3f}, rms-fluctuation field error {es:.3f}, rms ratio "
+            f"{np.linalg.norm(sP) / max(np.linalg.norm(sT), 1e-30):.2f} (1 = right fluctuation strength)", summary=True)
+    vel = velocity_channels(T.names, args.velocity)
+    sp = T.spacing()
+    if vel and T.grid and sp:
+        iu, iv = vel
+        dx, dy = sp
+        kt, et = ke_spectrum(T.fields[n - 1, iu], T.fields[n - 1, iv], dx, dy, T.mask)
+        kp, ep = ke_spectrum(P.fields[n - 1, iu], P.fields[n - 1, iv], dx, dy, T.mask)
+        hi = kt > kt[len(kt) // 2]
+        ratio = ep[hi].sum() / max(et[hi].sum(), 1e-300)
+        rep.say(f"energy at the higher half of wavenumbers: prediction / truth = {ratio:.2f}"
+                + (" (small scales lost: over-smoothed)" if ratio < 0.7 else " (spurious small-scale energy)" if ratio > 1.4
+                   else ""), summary=True)
+        dt_ = divergence(T.fields[:n, iu], T.fields[:n, iv], dx, dy, T.mask)
+        dp_ = divergence(P.fields[:n, iu], P.fields[:n, iv], dx, dy, T.mask)
+        rep.say(f"divergence of velocity (relative to the velocity gradients): prediction {dp_:.3f}, truth {dt_:.3f}"
+                + (" (prediction breaks mass conservation)" if dp_ > 3 * max(dt_, 0.01) else ""), summary=True)
+    fig, ax = plt.subplots(1, 2 if (vel and T.grid and sp) else 1, figsize=(10 if vel else 5.5, 3.2), squeeze=False)
+    for i, c in enumerate(T.names):
+        ax[0, 0].plot(t, E[:, i], lw=0.9, color=COLORS[i % len(COLORS)], label=c)
+    ax[0, 0].plot(t, overall, lw=1.4, color="k", label="all")
+    ax[0, 0].axhline(0.5, color="#8c8c8c", ls=":", lw=0.8)
+    ax[0, 0].set_xlabel("time"); ax[0, 0].set_ylabel("relative L2 error"); ax[0, 0].legend(fontsize=7, ncol=3)
+    if vel and T.grid and sp:
+        ax[0, 1].loglog(kt[1:], et[1:], color="k", label="truth")
+        ax[0, 1].loglog(kp[1:], ep[1:], color=COLORS[3], label="prediction")
+        ax[0, 1].set_xlabel("wavenumber"); ax[0, 1].set_ylabel("kinetic energy"); ax[0, 1].legend(fontsize=7)
+        ax[0, 1].set_title(f"spectrum at t = {fmt(t[-1])}")
+    rep.figure(fig, "evaluate")
+    c = T.names.index(args.channel) if args.channel else 0
+    k = n - 1
+    if T.grid or T.points is not None:
+        get = (lambda tr, j: tr.fields[j, c]) if T.grid else (lambda tr, j: tr.fields[j, :, c])
+        fig, ax = plt.subplots(1, 4, figsize=(14, 2.8))
+        _field_image(ax[0], T, get(T, k), f"truth {T.names[c]}, t = {fmt(t[k])}")
+        _field_image(ax[1], T, get(P, k), "prediction")
+        _field_image(ax[2], T, get(P, k) - get(T, k), "error")
+        err_mean = np.mean(np.abs(P.fields[:n] - T.fields[:n]), 0)
+        _field_image(ax[3], T, err_mean[c] if T.grid else err_mean[:, c], "mean |error| over time", cmap="magma", sym=False)
+        rep.figure(fig, "fields")
+    rep.close()
+
+
+def _probe_signals(traj, picks, n):
+    X = traj.flat()[:n]
+    return X[:, picks, :].reshape(n, -1)
+
+
+def cmd_rollout(args):
+    from .mldata import load
+    from .mleval import dynamics, field_sample, pick_probes, windows
+    P = load(args.pred, args.field)
+    T = load(args.truth, args.field) if args.truth else None
+    ref = T or P
+    picks = pick_probes(ref, args.probes)
+    dt = float(np.median(np.diff(P.times)))
+    YP = _probe_signals(P, picks, len(P.times))
+    finite = np.isfinite(YP).all(1)
+    blow = None if finite.all() else int(np.argmin(finite))
+    if T is not None:
+        lim = 10 * np.abs(T.flat()).max()
+        big = np.nonzero(np.abs(YP).max(1) > lim)[0]
+        if big.size and (blow is None or big[0] < blow):
+            blow = int(big[0])
+    rep = Report(_out(args, "cfdml_rollout"), f"Long rollout: {Path(args.pred).name}")
+    rep.say(f"prediction: {len(P.times)} steps, t = {fmt(P.times[0])} to {fmt(P.times[-1])}; "
+            + (f"truth: {len(T.times)} steps" if T is not None else "no truth given") + f"; {len(picks)} probes "
+            "at the points of largest fluctuation")
+    if blow is not None:
+        rep.say(f"**the rollout blows up** at step {blow} (t = {fmt(P.times[blow])})", summary=True)
+        YP = YP[:max(blow, 2)]
+    FP, idx = field_sample(P, n=len(YP), idx=None)
+    if T is not None:
+        _, idx = field_sample(T)
+        FP, _ = field_sample(P, n=len(YP), idx=idx)
+    dP = dynamics(FP[len(FP) // 2:], dt)
+    dP.update(f=dynamics(YP[len(YP) // 2:], dt)["f"], amp=dynamics(YP[len(YP) // 2:], dt)["amp"])
+    rows = [["prediction (second half)", dP["kind"], fmt(dP["f"]), fmt(dP["amp"], 3), fmt(dP["mean"], 3)]]
+    if T is not None:
+        YT = _probe_signals(T, picks, len(T.times))
+        cut = int(len(YT) * args.skip)
+        dtT = float(np.median(np.diff(T.times)))
+        FT, _ = field_sample(T, idx=idx)
+        dT = dynamics(FT[cut:], dtT)
+        dT.update(f=dynamics(YT[cut:], dtT)["f"], amp=dynamics(YT[cut:], dtT)["amp"])
+        rows.insert(0, ["truth", dT["kind"], fmt(dT["f"]), fmt(dT["amp"], 3), fmt(dT["mean"], 3)])
+    rep.table(["", "flow type", "frequency", "amplitude", "mean"], rows)
+    if T is not None:
+        if dT["kind"] != dP["kind"]:
+            rep.say(f"**flow type changed**: truth is {dT['kind']}, the rollout ends {dP['kind']}", summary=True)
+        else:
+            rep.say(f"flow type kept: {dP['kind']}", summary=True)
+        if dT["f"] and dP["f"] and np.isfinite(dP["f"]):
+            rep.say(f"frequency: {fmt(dP['f'])} vs truth {fmt(dT['f'])} ({100 * (dP['f'] - dT['f']) / dT['f']:+.1f}%)",
+                    summary=True)
+        if dT["amp"]:
+            rep.say(f"amplitude: {dP['amp'] / dT['amp']:.2f} of the truth"
+                    + (" (the dynamics are dying out)" if dP["amp"] < 0.5 * dT["amp"] else
+                       " (too energetic)" if dP["amp"] > 1.5 * dT["amp"] else ""), summary=True)
+    else:
+        rep.say(f"the rollout ends {dP['kind']}, frequency {fmt(dP['f'])}, amplitude {fmt(dP['amp'], 3)}", summary=True)
+    f_ref = (dT["f"] if T is not None and dT["f"] else dP["f"]) or 0
+    W = windows(YP, dt, int(round(1 / f_ref / dt)) if f_ref and np.isfinite(f_ref) and f_ref > 0 else 20)
+    if len(W) >= 3:
+        f0, f1 = W[0, 1], W[-1, 1]
+        a0, a1 = W[0, 2], W[-1, 2]
+        if f0 > 0 and abs(f1 - f0) / f0 > 0.05:
+            rep.say(f"frequency drifts from {fmt(f0)} to {fmt(f1)} ({100 * (f1 - f0) / f0:+.0f}%) over the rollout", summary=True)
+        if a0 > 0 and abs(a1 - a0) / a0 > 0.2:
+            rep.say(f"amplitude changes from {fmt(a0, 3)} to {fmt(a1, 3)} ({100 * (a1 - a0) / a0:+.0f}%) over the rollout",
+                    summary=True)
+    fig, ax = plt.subplots(3, 1, figsize=(10, 7))
+    tp = P.times[:len(YP)]
+    j = int(np.argmax(np.nan_to_num(YP).std(0)))
+    if T is not None:
+        ax[0].plot(T.times, YT[:, j], color="k", lw=1, label="truth")
+    ax[0].plot(tp, YP[:, j], color=COLORS[3], lw=0.8, label="prediction")
+    ax[0].set_ylabel("probe"); ax[0].legend(fontsize=7)
+    if len(W):
+        tw = P.times[0] + W[:, 0] * dt
+        ax[1].plot(tw, W[:, 1], "o-", ms=3, color=COLORS[3], label="prediction")
+        ax[2].plot(tw, W[:, 2], "o-", ms=3, color=COLORS[3])
+        if T is not None and dT["f"]:
+            ax[1].axhline(dT["f"], color="k", ls="--", lw=0.8, label="truth")
+            ax[2].axhline(dT["amp"], color="k", ls="--", lw=0.8)
+        ax[1].set_ylabel("frequency"); ax[1].legend(fontsize=7)
+        ax[2].set_ylabel("amplitude")
+    ax[2].set_xlabel("time")
+    rep.figure(fig, "rollout")
+    rep.close()
+
+
+def cmd_dataset(args):
+    import json
+    from .mldata import load
+    from .mleval import dynamics, field_sample, jumps
+    from .verify import transient_end
+    p = Path(args.path)
+    split = json.loads((p / "split.json").read_text()) if (p / "split.json").exists() else {}
+    files = sorted((p / "cases").glob("*.npz")) if (p / "cases").is_dir() else sorted(p.glob("*.npz")) if p.is_dir() else [p]
+    if not files:
+        raise CfdmlError(f"no trajectory .npz files in {p}", hint="make a dataset with  cfdml export")
+    rep = Report(_out(args, "cfdml_dataset_audit"), f"Dataset audit: {p.name}")
+    rows, means, params, kinds, problems = [], [], {}, {}, []
+    for f in files:
+        tr = load(f)
+        name = f.stem
+        X = tr.flat()
+        n = len(tr.times)
+        issues = []
+        bad = (~np.isfinite(X)).sum()
+        if bad:
+            issues.append(f"{bad} NaN/inf values")
+        const = [c for i, c in enumerate(tr.names) if np.nanstd(X[:, :, i]) == 0]
+        if const:
+            issues.append("constant: " + ", ".join(const))
+        d = np.diff(tr.times)
+        if n > 2 and np.ptp(d) > 0.01 * np.median(d):
+            issues.append("uneven time step")
+        big, dup = jumps(X)
+        if big.size:
+            issues.append("sudden jump after snapshot " + ", ".join(str(j) for j in big[:5])
+                          + (" (the first snapshot does not follow from the rest)" if big[0] == 0 else ""))
+        if dup.size:
+            issues.append(f"{dup.size} repeated snapshots")
+        g = np.nan_to_num(X).reshape(n, -1)
+        sig = g[:, np.argmax(g.std(0))] if g.std(0).max() > 0 else g[:, 0]
+        te = None
+        if n >= 40 and np.ptp(sig) > 0:
+            te, _ = transient_end(tr.times, sig)
+            if te is None:
+                issues.append("still changing at the end")
+            elif te > tr.times[0] + 0.1 * (tr.times[-1] - tr.times[0]):
+                issues.append(f"start-up transient until t = {fmt(te)} ({100 * (te - tr.times[0]) / (tr.times[-1] - tr.times[0]):.0f}%)")
+        start = 1 if big.size and big[0] == 0 else 0
+        Ys, _ = field_sample(tr)
+        dyn = dynamics(np.nan_to_num(Ys[start:]), float(np.median(d))) if n > 2 else dict(kind="single snapshot", f=None)
+        kinds[name] = dyn["kind"]
+        means.append(np.nan_to_num(X).mean(0).ravel())
+        params[name] = tr.params
+        which = next((k for k, v in split.items() if isinstance(v, list) and name in v), "-")
+        rows.append([name, which, n, dyn["kind"], fmt(dyn["f"]) if dyn["f"] and np.isfinite(dyn["f"]) else "-",
+                     "; ".join(issues) or "ok"])
+        if issues:
+            problems.append(name)
+    rep.table(["case", "split", "snapshots", "flow type", "frequency", "checks"], rows)
+    rep.say(f"{len(files)} cases; {len(problems)} with issues" + (f": {', '.join(problems[:10])}" if problems else ""),
+            summary=True)
+    counts = {}
+    for k in kinds.values():
+        counts[k] = counts.get(k, 0) + 1
+    rep.say("flow types: " + ", ".join(f"{k} {v}" for k, v in counts.items()), summary=True)
+    if len(means) > 1 and len({m.size for m in means}) == 1:
+        M = np.array(means)
+        D = np.sqrt(((M[:, None] - M[None]) ** 2).mean(-1))
+        scale = np.median(D[np.triu_indices(len(M), 1)])
+        dup = [(i, j) for i in range(len(M)) for j in range(i + 1, len(M)) if D[i, j] < 0.01 * max(scale, 1e-30)]
+        names_ = [f.stem for f in files]
+        if dup:
+            rep.say("near-duplicate cases (mean fields within 1% of the typical difference): "
+                    + ", ".join(f"{names_[i]} / {names_[j]}" for i, j in dup[:10]), summary=True)
+    if split and not split.get("by_time"):
+        for sp in ("val", "test"):
+            for k in split.get(sp, []):
+                if kinds.get(k) and kinds[k] not in {kinds.get(t) for t in split.get("train", [])}:
+                    rep.say(f"{sp} case {k} is {kinds[k]}, a flow type the training set does not contain", summary=True)
+        pnames = sorted({q for v in params.values() for q in v})
+        for q in pnames:
+            tr_vals = [params[k][q] for k in split.get("train", []) if q in params.get(k, {})]
+            if not tr_vals:
+                continue
+            lo, hi = min(tr_vals), max(tr_vals)
+            out = [k for sp in ("val", "test") for k in split.get(sp, []) if q in params.get(k, {})
+                   and not lo <= params[k][q] <= hi]
+            if out:
+                rep.say(f"{q} of {', '.join(out)} lies outside the training range [{fmt(lo)}, {fmt(hi)}]: those cases "
+                        "test extrapolation", summary=True)
+        seen = {}
+        for sp in ("train", "val", "test"):
+            for k in split.get(sp, []):
+                key = tuple(sorted(params.get(k, {}).items()))
+                if key and key in seen and seen[key][0] != sp:
+                    rep.say(f"leak: {k} ({sp}) has the same inputs as {seen[key][1]} ({seen[key][0]})", summary=True)
+                seen.setdefault(key, (sp, k))
+        if pnames and len(pnames) >= 1:
+            fig, ax = plt.subplots(figsize=(5, 3.6))
+            a = pnames[0]; b = pnames[1] if len(pnames) > 1 else None
+            for sp, c in (("train", COLORS[0]), ("val", COLORS[1]), ("test", COLORS[3])):
+                ks = [k for k in split.get(sp, []) if a in params.get(k, {})]
+                ax.plot([params[k][a] for k in ks], [params[k][b] if b else 0 for k in ks], "o", color=c, label=sp)
+            ax.set_xlabel(a); ax.set_ylabel(b or ""); ax.legend(fontsize=7); ax.set_title("inputs by split")
+            rep.figure(fig, "coverage")
+    rep.close()
+    return 3 if problems else 0

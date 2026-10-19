@@ -25,6 +25,10 @@ OpenFOAM cases, `postProcessing` files, CSVs and VTK files.
 | `cfdml average` | time-averaged fields and Reynolds stresses (`UMean`, `UPrime2Mean`) in OpenFOAM format |
 | `cfdml sensitivity` | Sobol first-order and total indices of a sweep model |
 | `cfdml optimize` | constrained optimum on a sweep model, and the next run to verify it |
+| `cfdml export` | cases or a sweep to an ML dataset: one `.npz` per case on a regular grid, split by case, train statistics |
+| `cfdml evaluate` | ML prediction vs CFD: error growth, mean / rms statistics, energy spectra, divergence, error maps |
+| `cfdml rollout` | long rollouts of a learned model: flow type kept or lost, frequency drift, amplitude decay, blow-up |
+| `cfdml dataset` | audit a dataset: NaNs, jumps, repeated frames, transients, duplicates, flow types, split leaks |
 
 ## Install
 
@@ -100,6 +104,27 @@ cfdml average case -f U -f p --after auto --into-case
 
 `forces` joins restarted runs (several start-time folders) and reads the old `forces.dat` and the newer `force.dat`
 layouts. `average --after auto` takes the end of the transient from the forces in `postProcessing`.
+
+## Machine-learning datasets and models
+
+```bash
+cfdml export --sweep sweep.yaml -f U -f p --grid 256 --after auto -o data
+cfdml dataset data
+cfdml evaluate my_model_rollout.npz data/cases/Re350_a4.npz
+cfdml rollout my_model_long_rollout.npz --truth data/cases/Re350_a4.npz
+```
+
+A trajectory is an `.npz` with `fields` shaped (T, C, H, W) on a grid or (T, N, C) on cells, plus optional `times`,
+`names`, `x`, `y`, `points` and `mask` (fluid cells). Predictions from any model can be checked as long as they are
+saved this way. `export` splits by case so that neighbouring time steps of one run never end up in both training and
+test data, and computes normalisation statistics from the training cases only.
+
+`evaluate` reports relative L2 error per channel over time, errors of the time-mean and rms fields (the fair test
+for chaotic flows, where pointwise errors grow anyway), kinetic-energy spectra and the divergence of the predicted
+velocity. `rollout` classifies the flow type from the recurrence of the whole field (periodic, chaotic or steady)
+and tracks frequency and amplitude in sliding windows. `dataset` flags snapshots that do not follow from their
+neighbours (robust z-score above 10), repeated frames, start-up transients, near-duplicate cases, flow types missing
+from the training split, and validation or test inputs outside the training range.
 
 ## Sweeps
 

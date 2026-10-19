@@ -21,6 +21,10 @@ examples:
   cfdml average case -f U -f p --after auto
   cfdml sensitivity demo/cfdml_sweep
   cfdml optimize demo/cfdml_sweep --minimize Cd --subject-to St>=0.2
+  cfdml export --sweep demo/sweep.yaml -f U -o data
+  cfdml evaluate pred.npz data/cases/Re350_a4.npz
+  cfdml rollout pred.npz --truth data/cases/Re350_a4.npz
+  cfdml dataset data
   cfdml init sweep                                  write a sweep config to fill in
   cfdml sweep demo/sweep.yaml                       learn outputs from a set of runs
   cfdml predict demo/cfdml_sweep/model.pkl --at Re=350,angle=4
@@ -160,6 +164,38 @@ def build():
     s.add_argument("--subject-to", action="append", help="constraint like St<=0.21 (repeat for more)")
     s.add_argument("--fix", action="append", help="hold an input fixed, e.g. angle=5")
     s.add_argument("--confidence", type=float, default=0.95, help="required probability that constraints hold (default 0.95)")
+
+    s = p("export", "OpenFOAM cases (or a sweep) to an ML-ready dataset: npz per case, split by case, train statistics",
+          C.cmd_export)
+    s.add_argument("cases", nargs="*", help="case folders")
+    s.add_argument("--sweep", help="take the cases and their input values from a sweep config")
+    s.add_argument("-f", "--field", action="append", help="field to export (repeat)")
+    s.add_argument("--grid", default="128", help="regular grid NX or NXxNY (default 128, NY from the aspect ratio)")
+    s.add_argument("--no-grid", dest="grid", action="store_const", const=None, help="keep the cells (unstructured)")
+    s.add_argument("--box", help="grid region xmin,xmax,ymin,ymax")
+    s.add_argument("--after", help="start time, or auto (from the forces)")
+    s.add_argument("--before", type=float); s.add_argument("--every", type=int, default=1)
+    s.add_argument("--split", default="0.7,0.15,0.15", help="train,val,test fractions (default 0.7,0.15,0.15)")
+    s.add_argument("--seed", type=int, default=0)
+
+    s = p("evaluate", "ML prediction vs CFD truth: error growth, statistics, spectra, divergence, error maps", C.cmd_evaluate)
+    s.add_argument("pred", help="prediction: trajectory .npz or OpenFOAM case")
+    s.add_argument("truth", help="truth: trajectory .npz or OpenFOAM case")
+    s.add_argument("-f", "--field", action="append", help="fields to compare when the inputs are OpenFOAM cases")
+    s.add_argument("--velocity", help="velocity channel names u,v (default: Ux,Uy or u,v)")
+    s.add_argument("--channel", help="channel for the field pictures (default: the first)")
+    s.add_argument("--steps", type=int, help="compare only the first N snapshots")
+
+    s = p("rollout", "long-horizon behaviour of a learned model: flow type, frequency drift, amplitude, blow-up", C.cmd_rollout)
+    s.add_argument("pred", help="long prediction: trajectory .npz or OpenFOAM case")
+    s.add_argument("--truth", help="reference trajectory (may be shorter than the prediction)")
+    s.add_argument("-f", "--field", action="append")
+    s.add_argument("--probes", type=int, default=4, help="number of probe points (default 4)")
+    s.add_argument("--skip", type=float, default=0.2, help="fraction of the truth treated as transient (default 0.2)")
+
+    s = p("dataset", "audit an ML dataset: bad values, jumps, transients, duplicates, flow types, split coverage and leaks",
+          C.cmd_dataset)
+    s.add_argument("path", help="folder from cfdml export, a folder of .npz trajectories, or one .npz")
 
     s = p("init", "write a commented template config", C.cmd_init)
     s.add_argument("kind", choices=["sweep"]); s.add_argument("--force", action="store_true")
