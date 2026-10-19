@@ -67,6 +67,8 @@ def make_wake_case(case, nx=60, ny=20, t_end=40.0, write_every=0.5, f=0.2, seed=
         lines.append(f"{t:>17.6g}" + "".join(f"    ({u:.6g} {v:.6g} 0)" for u, v, _ in U))
     (d / "U").write_text("\n".join(lines) + "\n")
     _force_file(Path(case), ts, f, cd=1.33, cl_amp=0.6, rng=rng)
+    _force_dat(Path(case), ts, f, rng)
+    _log(case, ts, f)
 
 
 def _force_file(case, ts, f, cd, cl_amp, rng, ramp=6.0):
@@ -192,3 +194,48 @@ def make_drops_case(case, nx=80, ny=60, t_end=10.0, write_every=0.25):
             r = np.hypot(X - xc, Y - yc)
             alpha = np.maximum(alpha, np.clip((0.3 - r) / 0.05 + 0.5, 0, 1))
         foam.write_field(Path(case) / f"{t:g}" / "alpha.water", "alpha.water", alpha, h)
+
+
+def _log(case, ts, f, seed=2):
+    rng = np.random.default_rng(seed)
+    out = ["/*---------------------------------------------------------------------------*\\",
+           "| =========                 |                                                 |",
+           "| \\\\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |",
+           "\\*---------------------------------------------------------------------------*/",
+           "Build  : _66908158-20231220 OPENFOAM=2312", "Exec   : pimpleFoam", "", "Starting time loop", ""]
+    wall = 0.0
+    for i, t in enumerate(ts[1:]):
+        co = 0.45 + 0.05 * np.sin(2 * np.pi * f * t) + (0.6 if 2000 < i < 2010 else 0)
+        out += [f"Courant Number mean: {co / 6:.6g} max: {co:.6g}", "deltaT = 0.05", f"Time = {t:g}", ""]
+        r0 = 10 ** (-1.5 - 1.5 * min(t, 10) / 10 + 0.1 * rng.standard_normal())
+        for k in (1, 2):
+            out.append(f"PIMPLE: iteration {k}")
+            for fld, s in (("Ux", 1.0), ("Uy", 2.0)):
+                out.append(f"smoothSolver:  Solving for {fld}, Initial residual = {s * r0 / k:.6g}, "
+                           f"Final residual = {s * r0 * 1e-3:.6g}, No Iterations 2")
+            for j in range(2):
+                out.append(f"GAMG:  Solving for p, Initial residual = {5 * r0 / k / (1 + 9 * j):.6g}, "
+                           f"Final residual = {r0 * 1e-4:.6g}, No Iterations {12 - 4 * j}")
+                out.append(f"time step continuity errors : sum local = {r0 * 1e-4:.6g}, global = {r0 * 1e-6:.6g}, "
+                           f"cumulative = {r0 * 1e-5:.6g}")
+        wall += 0.02 + 0.002 * rng.random()
+        out += [f"ExecutionTime = {wall:.2f} s  ClockTime = {int(wall)} s", ""]
+    out += ["End", ""]
+    (Path(case) / "log.pimpleFoam").write_text("\n".join(out))
+
+
+def _force_dat(case, ts, f, rng, ramp=6.0):
+    a = 1 - np.exp(-ts / ramp)
+    q = 0.5 * 1.0 * 1.0 ** 2 * 0.1
+    fy = q * (0.6 * a * np.sin(2 * np.pi * f * ts) + 0.003 * rng.standard_normal(len(ts)))
+    fxp = q * (1.05 + 0.03 * a * np.sin(4 * np.pi * f * ts))
+    fxv = q * (0.28 + 0.01 * a * np.sin(4 * np.pi * f * ts))
+    head = ["# Force", "# CofR                : (0 0 0)", "#",
+            "# Time          \ttotal_x\ttotal_y\ttotal_z\tpressure_x\tpressure_y\tpressure_z\tviscous_x\tviscous_y\tviscous_z"]
+    rows = [f"{t:g}\t{p + v:.8g}\t{y:.8g}\t0\t{p:.8g}\t{0.97 * y:.8g}\t0\t{v:.8g}\t{0.03 * y:.8g}\t0"
+            for t, p, v, y in zip(ts, fxp, fxv, fy)]
+    cut = len(ts) // 2
+    for start, part in (("0", rows[:cut + 40]), (f"{ts[cut]:g}", rows[cut:])):
+        d = Path(case) / "postProcessing/forces" / start
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "force.dat").write_text("\n".join(head + part) + "\n")

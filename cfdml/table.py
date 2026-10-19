@@ -57,6 +57,16 @@ def _is_number(x):
 def read_table(path):
     path = Path(path)
     if path.is_dir():
+        subs = sorted((float(d.name), d) for d in path.iterdir() if d.is_dir() and _is_number(d.name))
+        files = [sorted(f for f in d.iterdir() if f.is_file()) for _, d in subs]
+        names = {f.name for fs in files for f in fs}
+        if subs and len(names) == 1:
+            parts = [read_table(fs[0]) for fs in files if fs]
+            out = parts[0]
+            for p in parts[1:]:
+                keep = out.time < p.time[0]
+                out = Table(out.names, np.vstack([out.data[keep], p.data[:, :out.data.shape[1]]]), str(path))
+            return out
         dats = sorted(path.rglob("*.dat")) + sorted(path.rglob("*.csv"))
         raise CfdmlError(f"{path} is a folder; give a file", hint="files found: " + ", ".join(str(d) for d in dats[:8])
                          if dats else None)

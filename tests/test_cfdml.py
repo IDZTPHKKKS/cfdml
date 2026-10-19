@@ -175,3 +175,120 @@ def test_help(cmd, capsys):
     with pytest.raises(SystemExit) as e:
         main(cmd + ["--help"])
     assert e.value.code == 0 and "usage" in capsys.readouterr().out
+
+
+def test_force_layouts(tmp_path):
+    from cfdml.forces import read_forces
+    t = np.arange(0, 5, 0.5)
+    old = ["# Forces", "# CofR  : (0 0 0)", "# Time  forces(pressure viscous porous) moment(pressure viscous porous)"]
+    old += [f"{x}\t(({1 + x} {0.1 * x} 0) (0.2 0.01 0) (0 0 0)) ((0 0 {x}) (0 0 0) (0 0 0))" for x in t]
+    (tmp_path / "old.dat").write_text("\n".join(old) + "\n")
+    F = read_forces(tmp_path / "old.dat")
+    assert np.allclose(F["total_x"], 1.2 + t) and np.allclose(F["total_y"], 0.1 * t + 0.01)
+    assert np.allclose(F["moment_pressure_z"], t)
+    v8 = ["# Time                  (total_x total_y total_z) (pressure_x pressure_y pressure_z) (viscous_x viscous_y viscous_z)"]
+    v8 += [f"{x}  (3 {x} 0) (2.5 {x} 0) (0.5 0 0)" for x in t]
+    (tmp_path / "v8.dat").write_text("\n".join(v8) + "\n")
+    F = read_forces(tmp_path / "v8.dat")
+    assert np.allclose(F["total_x"], 3) and np.allclose(F["viscous_x"], 0.5) and np.allclose(F["total_y"], t)
+
+
+def test_residual_formats(tmp_path):
+    from cfdml.logs import parse_log, parse_solver_info
+    si = ["# Solver information", "# Time          \tU_solver\tUx_initial\tUx_final\tUx_iters\tp_solver\tp_initial\t"
+          "p_final\tp_iters\tp_converged"]
+    si += [f"{k}\tsmoothSolver\t{10.0 ** -k}\t1e-9\t3\tGAMG\t{2 * 10.0 ** -k}\t1e-8\t12\ttrue" for k in range(1, 6)]
+    (tmp_path / "solverInfo.dat").write_text("\n".join(si) + "\n")
+    R = parse_solver_info(tmp_path / "solverInfo.dat")
+    assert list(R["init"]) == ["Ux", "p"] and np.allclose(R["init"]["p"], 2 * 10.0 ** -np.arange(1, 6))
+    (tmp_path / "residuals.dat").write_text("# Residuals\n# Time p Ux Uy\n1 0.1 N/A 0.2\n2 0.01 0.02 0.03\n")
+    R = parse_solver_info(tmp_path / "residuals.dat")
+    assert np.isnan(R["init"]["Ux"][0]) and R["init"]["p"][1] == 0.01
+    ico = ["Time = 0.005", "", "Courant Number mean: 0.1 max: 0.7",
+           "DILUPBiCG:  Solving for Ux, Initial residual = 1, Final residual = 1e-6, No Iterations 8",
+           "DICPCG:  Solving for p, Initial residual = 1, Final residual = 1e-7, No Iterations 35",
+           "Time = 0.01", "", "Courant Number mean: 0.1 max: 0.9",
+           "DILUPBiCG:  Solving for Ux, Initial residual = nan, Final residual = nan, No Iterations 1000",
+           "#0  Foam::error::printStack(Foam::Ostream&)", "Floating point exception (core dumped)"]
+    (tmp_path / "log.icoFoam").write_text("\n".join(ico) + "\n")
+    R = parse_log(tmp_path / "log.icoFoam")
+    assert list(R["co"]) == [0.7, 0.9] and R["fatal"][1] == 0.01 and R["nan"] == ["Ux"] and not R["ended"]
+
+
+def test_new_commands(demo, tmp_path, capsys):
+    o = str(tmp_path)
+    assert main(["residuals", str(demo / "wake"), "-o", o + "/r"]) == 0
+    assert "finished" in capsys.readouterr().out
+    assert main(["forces", str(demo / "wake"), "--rho", "1", "-U", "1", "--area", "0.1", "-o", o + "/f"]) == 0
+    out = capsys.readouterr().out
+    assert "2401 samples" in out and "pressure 78.9%" in out
+    assert main(["average", str(demo / "wake"), "-f", "U", "--after", "20", "-o", o + "/a"]) == 0
+    M = foam.read_field(tmp_path / "a/40/UMean")
+    ts = [d for t, d in foam.times(demo / "wake", ["U"]) if t >= 20]
+    assert np.allclose(M, np.mean([foam.read_field(d / "U") for d in ts], 0), atol=1e-7)
+
+
+def _decompose(src, dst, nproc):
+    import shutil
+    shutil.copytree(src / "system", dst / "system")
+    (dst / "constant").mkdir()
+    nc = foam.n_cells(src)
+    edges = np.linspace(0, nc, nproc + 1).astype(int)
+    for _, d in foam.times(src):
+        for f in d.iterdir():
+            v = foam.read_field(f, nc)
+            h = foam.field_header(f)
+            for p in range(nproc):
+                foam.write_field(dst / f"processor{p}" / d.name / f.name, f.name, v[edges[p]:edges[p + 1]], h)
+    shutil.copytree(src / "postProcessing", dst / "postProcessing")
+
+
+def test_decomposed(demo, tmp_path):
+    rec, dec = demo / "wake", tmp_path / "dec"
+    _decompose(rec, dec, 11)
+    assert foam.is_decomposed(dec) and foam.n_cells(dec) == foam.n_cells(rec)
+    assert np.allclose(foam.cell_centres(dec), foam.cell_centres(rec))
+    assert main(["pod", str(dec), "--after", "20", "--write-modes", "-o", str(tmp_path / "pd")]) == 0
+    assert main(["pod", str(rec), "--after", "20", "-o", str(tmp_path / "pr")]) == 0
+    assert np.allclose(np.load(tmp_path / "pd/pod.npz")["energy"], np.load(tmp_path / "pr/pod.npz")["energy"])
+    assert (tmp_path / "pd/foam_modes/processor10/1/U").exists()
+    assert main(["average", str(dec), "-f", "U", "--after", "20", "-o", str(tmp_path / "ad")]) == 0
+    assert main(["average", str(rec), "-f", "U", "--after", "20", "-o", str(tmp_path / "ar")]) == 0
+    parts = np.concatenate([foam.read_field(tmp_path / f"ad/processor{p}/40/UMean") for p in range(11)])
+    assert np.allclose(parts, foam.read_field(tmp_path / "ar/40/UMean"))
+    assert main(["average", str(dec), "-f", "U", "--after", "20", "--into-case", "-o", str(tmp_path / "ai")]) == 0
+    assert (dec / "processor3/40/UMean").exists()
+    assert main(["average", str(dec), "-f", "U", "--after", "20", "--into-case", "-o", str(tmp_path / "ai2")]) == 1
+
+
+def test_sobol_estimator():
+    from cfdml.sweep import sobol
+
+    class Exact:
+        inputs = ["a", "b", "c"]
+        lo, hi = np.full(3, -np.pi), np.full(3, np.pi)
+
+        class scaler:
+            log = np.zeros(3, bool)
+
+        @staticmethod
+        def predict(X):
+            return {"f": (np.sin(X[:, 0]) + 7 * np.sin(X[:, 1]) ** 2 + 0.1 * X[:, 2] ** 4 * np.sin(X[:, 0]), None)}
+
+    S = sobol(Exact, "f", n=2 ** 15, boot=0)
+    assert np.allclose(S["S1"], [0.314, 0.442, 0.0], atol=0.03) and np.allclose(S["ST"], [0.558, 0.442, 0.244], atol=0.03)
+
+
+def test_optimize_and_sensitivity(demo, tmp_path, capsys):
+    from cfdml.demo import truth
+    o = str(tmp_path)
+    assert main(["sweep", str(demo / "sweep.yaml"), "-o", o + "/w"]) == 0
+    capsys.readouterr()
+    assert main(["optimize", o + "/w", "--maximize", "Cl_amp", "--subject-to", "Cd<=1.5", "-o", o + "/op"]) == 0
+    out = capsys.readouterr().out
+    import re
+    re_, ang = map(float, re.search(r"Re=([\d.]+), angle=([\d.]+)", out).groups())
+    assert abs(truth(re_, ang)[1] - 1.5) < 0.01 and 6.5 < ang < 7.5
+    assert main(["optimize", o + "/w", "--minimize", "Cd", "--subject-to", "St>=0.5", "-o", o + "/op2"]) == 1
+    assert main(["sensitivity", o + "/w", "-n", "1024", "-o", o + "/s"]) == 0
+    assert "Cd" in (tmp_path / "s/report.md").read_text()

@@ -16,6 +16,11 @@ examples:
   cfdml steady demo/wake/postProcessing/forceCoeffs/0/coefficient.dat
   cfdml gci --cells 25000,100000,400000 --values 1.42,1.39,1.385 --name Cd
   cfdml compare runs.csv -x Re -y St --ref cylinder-st-williamson
+  cfdml residuals case/log.pimpleFoam
+  cfdml forces case --rho 1 -U 1 --area 0.1
+  cfdml average case -f U -f p --after auto
+  cfdml sensitivity demo/cfdml_sweep
+  cfdml optimize demo/cfdml_sweep --minimize Cd --subject-to St>=0.2
   cfdml init sweep                                  write a sweep config to fill in
   cfdml sweep demo/sweep.yaml                       learn outputs from a set of runs
   cfdml predict demo/cfdml_sweep/model.pkl --at Re=350,angle=4
@@ -114,6 +119,45 @@ def build():
     s.add_argument("--ref-x"); s.add_argument("--ref-y")
     s.add_argument("--tol", type=float, default=5.0, help="tolerance band in %% (default 5)")
     s.add_argument("--list", action="store_true", help="list the built-in references")
+
+    s = p("residuals", "solver log or solverInfo: residuals, Courant number, crashes, convergence, time to finish",
+          C.cmd_residuals)
+    s.add_argument("path", help="log file (e.g. log.pimpleFoam), solverInfo.dat / residuals.dat, or a case folder")
+
+    s = p("forces", "forces function object output: drag/lift or Cd/Cl, pressure/viscous split, statistics", C.cmd_forces)
+    s.add_argument("path", help="force(s).dat, postProcessing/<forces> folder (restarts joined), or a case folder")
+    s.add_argument("--rho", type=float, help="reference density (with -U and --area gives coefficients)")
+    s.add_argument("-U", "--velocity", type=float, help="reference velocity")
+    s.add_argument("--area", type=float, help="reference area (2D: span x length, e.g. 0.1 x D)")
+    s.add_argument("-L", "--length", type=float, help="reference length, for the Strouhal number")
+    s.add_argument("--drag", default="x", choices=list("xyz"), help="drag direction (default x)")
+    s.add_argument("--lift", default="y", choices=list("xyz"), help="lift direction (default y)")
+    s.add_argument("--after", type=float, help="start of the statistics (default: detected)")
+    s.add_argument("--target", type=float, default=0.01, help="wanted relative precision of the means (default 0.01)")
+
+    s = p("average", "time-averaged fields and Reynolds stresses (fieldMean, fieldPrime2Mean) in OpenFOAM format",
+          C.cmd_average)
+    s.add_argument("case")
+    s.add_argument("-f", "--field", action="append", required=True, help="field to average (repeat for more)")
+    s.add_argument("--after", help="start time, or auto (from the forces in postProcessing)")
+    s.add_argument("--before", type=float, help="end time")
+    s.add_argument("--every", type=int, default=1, help="use every n-th time folder")
+    s.add_argument("--into-case", action="store_true", help="also write the averages into the last time folder")
+    s.add_argument("--force", action="store_true", help="overwrite existing average fields in the case")
+
+    s = p("sensitivity", "Sobol sensitivity indices (first-order and total) of a sweep model, with intervals",
+          C.cmd_sensitivity)
+    s.add_argument("model", help="model.pkl, or the sweep output folder")
+    s.add_argument("--output", action="append", help="output to analyse (repeat; default all)")
+    s.add_argument("-n", type=int, default=4096, help="Monte Carlo base samples (default 4096)")
+
+    s = p("optimize", "best inputs for an output on a sweep model, with constraints; and the next run to verify it",
+          C.cmd_optimize)
+    s.add_argument("model", help="model.pkl, or the sweep output folder")
+    s.add_argument("--minimize"); s.add_argument("--maximize")
+    s.add_argument("--subject-to", action="append", help="constraint like St<=0.21 (repeat for more)")
+    s.add_argument("--fix", action="append", help="hold an input fixed, e.g. angle=5")
+    s.add_argument("--confidence", type=float, default=0.95, help="required probability that constraints hold (default 0.95)")
 
     s = p("init", "write a commented template config", C.cmd_init)
     s.add_argument("kind", choices=["sweep"]); s.add_argument("--force", action="store_true")

@@ -169,12 +169,6 @@ def _loo(Z, y):
     return mu, sd
 
 
-def _relevance(g, n_in):
-    ls = np.atleast_1d(g.kernel_.k1.k2.length_scale)
-    inv = 1 / np.resize(ls, n_in)
-    return inv / inv.sum()
-
-
 class SweepModel:
 
     def __init__(self, inputs, log_inputs, rows):
@@ -197,14 +191,19 @@ class SweepModel:
         self.scalar[name] = dict(gp=g, y=y, have=have, loo=mu, loo_sd=sd,
                                  r2=float(1 - ((mu - y) ** 2).sum() / ss) if ss > 0 else float("nan"),
                                  rmse=float(np.sqrt(np.mean((mu - y) ** 2))),
-                                 coverage=float(np.mean(np.abs(mu - y) <= 2 * sd + 1e-12)),
-                                 relevance=_relevance(g, len(self.inputs)))
+                                 coverage=float(np.mean(np.abs(mu - y) <= 2 * sd + 1e-12)))
+        st = sobol(self, name, n=1024, boot=0)["ST"] if len(self.inputs) > 1 else np.ones(1)
+        st = np.clip(st, 0, None)
+        self.scalar[name]["relevance"] = st / st.sum() if st.sum() > 0 else np.full(len(st), 1 / len(st))
 
     def fit_field(self, name, time="latest", after=None, energy=0.999):
         snaps, cases = [], []
         for r in self.rows:
             if r["case"] is None:
                 raise CfdmlError(f"field '{name}': run '{r['name']}' has no case folder")
+            if foam.is_decomposed(r["case"]):
+                raise CfdmlError(f"field '{name}': run '{r['name']}' is decomposed",
+                                 hint="field surrogates need reconstructed cases: run  reconstructPar")
             snaps.append(_run_field(r["case"], name, time, after))
             cases.append(r["case"])
         shapes = {s.shape for s in snaps}
@@ -332,3 +331,42 @@ def parse_point(text, inputs):
         raise CfdmlError(f"inputs must be exactly {inputs}" + (f"; missing {missing}" if missing else "")
                          + (f"; unknown {extra}" if extra else ""))
     return np.array([vals[k] for k in inputs])
+
+
+def sample_inputs(model, n, rng, fixed=None):
+    log = model.scaler.log
+    lo, hi = model.lo.astype(float).copy(), model.hi.astype(float).copy()
+    lo[log], hi[log] = np.log(lo[log]), np.log(hi[log])
+    U = lo + rng.random((n, len(lo))) * (hi - lo)
+    U[:, log] = np.exp(U[:, log])
+    for j, v in (fixed or {}).items():
+        U[:, j] = v
+    return U
+
+
+def sobol(model, name, n=4096, seed=0, boot=200):
+    rng = np.random.default_rng(seed)
+    d = len(model.inputs)
+    A, B = sample_inputs(model, n, rng), sample_inputs(model, n, rng)
+    f = lambda X: model.predict(X)[name][0]
+    fA, fB = f(A), f(B)
+    fAB = []
+    for i in range(d):
+        ABi = A.copy(); ABi[:, i] = B[:, i]
+        fAB.append(f(ABi))
+    fAB = np.array(fAB)
+
+    def est(idx):
+        a, b, ab = fA[idx], fB[idx], fAB[:, idx]
+        var = np.var(np.r_[a, b])
+        if var <= 0:
+            return np.zeros(d), np.zeros(d)
+        s1 = np.mean(b * (ab - a), 1) / var
+        st = 0.5 * np.mean((a - ab) ** 2, 1) / var
+        return s1, st
+
+    s1, st = est(np.arange(n))
+    bs = [est(rng.integers(0, n, n)) for _ in range(boot)]
+    s1_ci = np.percentile([b[0] for b in bs], [2.5, 97.5], axis=0) if bs else None
+    st_ci = np.percentile([b[1] for b in bs], [2.5, 97.5], axis=0) if bs else None
+    return dict(S1=s1, ST=st, S1_ci=s1_ci, ST_ci=st_ci)

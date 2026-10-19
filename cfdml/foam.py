@@ -15,6 +15,8 @@ def _name(f):
 
 
 def _read_text(path):
+    if isinstance(path, ProcField):
+        path = path.paths[0]
     path = Path(path)
     if not path.exists() and Path(str(path) + ".gz").exists():
         path = Path(str(path) + ".gz")
@@ -48,11 +50,14 @@ def _time_dirs(case):
 
 
 def times(case, fields=None):
+    if _proc_dirs(case) and is_decomposed(case):
+        return proc_times(case, fields)
+    return _times(case, fields)
+
+
+def _times(case, fields=None):
     case = Path(case)
     td = _time_dirs(case)
-    if not td and any(case.glob("processor*")):
-        raise CfdmlError(f"{case} is decomposed (processor* folders) and has no reconstructed time folders",
-                         hint="run  reconstructPar  inside the case first")
     keep = []
     for t, d in td:
         names = {_name(f) for f in d.iterdir() if f.is_file()}
@@ -62,6 +67,8 @@ def times(case, fields=None):
 
 
 def field_names(case):
+    if _proc_dirs(case) and is_decomposed(case):
+        case = _proc_dirs(case)[0]
     count = {}
     for _, d in _time_dirs(case):
         for f in d.iterdir():
@@ -101,6 +108,8 @@ def _values(body, n):
 
 
 def read_field(path, n_cells=None):
+    if isinstance(path, ProcField):
+        return np.concatenate([read_field(p, c) for p, c in zip(path.paths, path.counts)])
     text = _strip_comments(_read_text(path))
     m = re.search(r"internalField\s+(uniform|nonuniform)\s*", text)
     if not m:
@@ -126,6 +135,8 @@ def _read_list(path):
 
 
 def n_cells(case):
+    if _proc_dirs(case) and is_decomposed(case):
+        return sum(proc_counts(case))
     owner = Path(case) / "constant/polyMesh/owner"
     if owner.exists() or Path(str(owner) + ".gz").exists():
         text = _read_text(owner)
@@ -145,6 +156,8 @@ def n_cells(case):
 
 
 def cell_centres(case):
+    if _proc_dirs(case) and is_decomposed(case):
+        return np.concatenate([cell_centres(p) for p in _proc_dirs(case)])
     case = Path(case)
     for _, d in _time_dirs(case):
         for name in ("C", "C.gz"):
@@ -173,6 +186,9 @@ def cell_centres(case):
 
 
 def cell_volumes(case):
+    if _proc_dirs(case) and is_decomposed(case):
+        v = [cell_volumes(p) for p in _proc_dirs(case)]
+        return None if any(x is None for x in v) else np.concatenate(v)
     for _, d in _time_dirs(case):
         if (Path(d) / "V").exists() or (Path(d) / "V.gz").exists():
             return read_field(Path(d) / "V")
@@ -180,6 +196,8 @@ def cell_volumes(case):
 
 
 def field_header(path):
+    if isinstance(path, ProcField):
+        path = path.paths[0]
     text = _read_text(path)
     cls = re.search(r"class\s+(\w+)\s*;", text)
     dims = re.search(r"dimensions\s+(\[[^\]]*\])\s*;", text)
@@ -189,6 +207,13 @@ def field_header(path):
 
 
 def write_field(path, name, values, header, note=""):
+    if isinstance(path, ProcField):
+        values = np.asarray(values)
+        start = 0
+        for p, c in zip(path.paths, path.counts):
+            write_field(p, name, values[start:start + c], header, note)
+            start += c
+        return
     values = np.asarray(values)
     vec = values.ndim == 2
     kind = {1: "scalar", 3: "vector", 6: "symmTensor", 9: "tensor"}[values.shape[1] if vec else 1]
@@ -202,6 +227,8 @@ def write_field(path, name, values, header, note=""):
 
 
 def internal_faces(case):
+    if _proc_dirs(case) and is_decomposed(case):
+        return None
     mesh = Path(case) / "constant/polyMesh"
     if not (mesh / "neighbour").exists() and not (mesh / "neighbour.gz").exists():
         return None
@@ -209,3 +236,69 @@ def internal_faces(case):
     nb, _, _ = _read_list(mesh / "neighbour")
     owner, neigh = np.array(ob.split(), int), np.array(nb.split(), int)
     return owner[:len(neigh)], neigh
+
+
+def _proc_dirs(case):
+    ps = [(int(m.group(1)), d) for d in Path(case).glob("processor*") if d.is_dir()
+          for m in [re.match(r"processor(\d+)$", d.name)] if m]
+    return [d for _, d in sorted(ps)]
+
+
+def is_decomposed(case):
+    case = Path(case)
+    if not _proc_dirs(case):
+        if any(case.glob("processors*")):
+            raise CfdmlError(f"{case} uses the collated format (processors*/), which cfdml cannot read",
+                             hint="run  reconstructPar , or decompose with  -fileHandler uncollated")
+        return False
+    return not any(_name(f) not in ("C", "V") for _, d in _time_dirs(case) if d.name != "0" for f in d.iterdir()
+                   if f.is_file())
+
+
+class ProcField:
+
+    def __init__(self, paths, counts):
+        self.paths, self.counts = list(paths), list(counts)
+        self.name = self.paths[0].name
+        self.parent = self.paths[0].parent
+
+    def exists(self):
+        return all(p.exists() or Path(str(p) + ".gz").exists() for p in self.paths)
+
+    def __str__(self):
+        return str(self.paths[0]).replace("processor0", "processor*")
+
+
+class TimeDir:
+    def __init__(self, dirs, counts):
+        self.dirs, self.counts = list(dirs), list(counts)
+        self.name = self.dirs[0].name
+
+    def __truediv__(self, name):
+        return ProcField([d / name for d in self.dirs], self.counts)
+
+    def __str__(self):
+        return str(self.dirs[0]).replace("processor0", "processor*")
+
+
+def proc_counts(case):
+    return [n_cells(p) for p in _proc_dirs(case)]
+
+
+def proc_times(case, fields=None):
+    procs = _proc_dirs(case)
+    counts = proc_counts(case)
+    out = []
+    for t, d0 in times(procs[0], fields):
+        dirs = [p / d0.name for p in procs]
+        if all(d.is_dir() for d in dirs) and (fields is None or all((d / f).exists() or Path(str(d / f) + ".gz").exists()
+                                                                  for d in dirs for f in fields)):
+            out.append((t, TimeDir(dirs, counts)))
+    return out
+
+
+def out_target(case, base, time_name, name):
+    if is_decomposed(case):
+        procs = _proc_dirs(case)
+        return ProcField([Path(base) / p.name / time_name / name for p in procs], proc_counts(case))
+    return Path(base) / time_name / name

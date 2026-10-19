@@ -20,6 +20,11 @@ OpenFOAM cases, `postProcessing` files, CSVs and VTK files.
 | `cfdml steady` | detects the start-up transient, means with 95% intervals, drift, how much longer to run |
 | `cfdml gci` | mesh convergence: observed order, extrapolated value, Grid Convergence Index |
 | `cfdml compare` | % error against built-in reference correlations or your own data |
+| `cfdml residuals` | residuals and Courant number from a solver log or solverInfo, crash detection, time to finish |
+| `cfdml forces` | forces function object output to Cd / Cl, pressure / viscous split, statistics |
+| `cfdml average` | time-averaged fields and Reynolds stresses (`UMean`, `UPrime2Mean`) in OpenFOAM format |
+| `cfdml sensitivity` | Sobol first-order and total indices of a sweep model |
+| `cfdml optimize` | constrained optimum on a sweep model, and the next run to verify it |
 
 ## Install
 
@@ -46,7 +51,8 @@ Each command prints a short summary and writes plots and a `report.md` to an out
 
 ## Notes on input
 
-- OpenFOAM cases must be ASCII and reconstructed (`foamFormatConvert`, `reconstructPar`).
+- OpenFOAM cases must be ASCII (`foamFormatConvert`). Decomposed cases (`processor*/`) are read directly; the
+  collated format (`processors*/`) is not.
 - `postProcess -func writeCellCentres` and `-func writeCellVolumes` are optional; cell centres are otherwise read
   from the mesh, and volumes default to equal weights.
 - Use `--after` to drop the start-up transient.
@@ -78,6 +84,17 @@ cfdml compare --list
 intervals (batches of at least two periods) and flags drift or a growing amplitude. `gci` follows Celik et al.
 (2008), J. Fluids Eng. 130, 078001. In a sweep config, `after: auto` uses the same transient detection.
 
+## Daily use
+
+```bash
+cfdml residuals case                    # newest log.*Foam, or postProcessing/solverInfo
+cfdml forces case --rho 1 -U 1 --area 0.1 -L 1
+cfdml average case -f U -f p --after auto --into-case
+```
+
+`forces` joins restarted runs (several start-time folders) and reads the old `forces.dat` and the newer `force.dat`
+layouts. `average --after auto` takes the end of the transient from the forces in `postProcessing`.
+
 ## Sweeps
 
 ```bash
@@ -90,7 +107,12 @@ cfdml predict cfdml_sweep/model.pkl --grid Re=200:1000:9 --grid voltage=0:10:6
 `sweep.yaml` lists the inputs, the outputs (read from each run's files, or typed in) and the runs; see the
 template from `cfdml init sweep`. A `fields:` entry also fits whole fields (POD + Gaussian process per coefficient),
 written back in OpenFOAM format. Scalar outputs use a Gaussian process with a Matern 5/2 kernel and one length scale
-per input. Reported errors are leave-one-out.
+per input. Reported errors are leave-one-out, and input importance is the Sobol total index.
+
+```bash
+cfdml sensitivity cfdml_sweep
+cfdml optimize cfdml_sweep --minimize Cd --subject-to "St>=0.2" --fix voltage=5
+```
 
 ## Examples from our runs
 

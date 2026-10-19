@@ -103,18 +103,15 @@ def cmd_spectrum(args):
 
 
 def _check_case(case):
-    if case.is_dir() and any(case.glob("processor*")) and not any(foam._time_dirs(case)):
-        raise CfdmlError(f"{case} is decomposed (processor* folders) and has no reconstructed time folders",
-                         hint="run  reconstructPar  inside the case first")
-    if not foam.is_case(case):
+    if not foam.is_case(case) and not (case.is_dir() and (case / "system").is_dir()):
         raise CfdmlError(f"{case} does not look like an OpenFOAM case (no system/ folder)")
+    if foam.is_decomposed(case):
+        print(f"  decomposed case: reading {len(foam._proc_dirs(case))} processor folders")
 
 
 def _case_snapshots(args):
     case = Path(args.case)
     _check_case(case)
-    if not foam.is_case(case):
-        raise CfdmlError(f"{case} does not look like an OpenFOAM case (no system/ folder)")
     ts = foam.times(case, [args.field])
     ts = [(t, d) for t, d in ts if (args.after is None or t >= args.after) and (args.before is None or t <= args.before)]
     if args.every > 1:
@@ -229,7 +226,7 @@ def cmd_pod(args):
                 full[np.ix_(idx, keep)] = M
             else:
                 full[idx] = M[:, 0]
-            foam.write_field(rep.out / "foam_modes" / f"{i + 1}" / args.field, args.field, full, hdr,
+            foam.write_field(foam.out_target(case, rep.out / "foam_modes", f"{i + 1}", args.field), args.field, full, hdr,
                              note=f"POD mode {i + 1}")
         rep.say(f"modes written as OpenFOAM fields in `foam_modes/<n>/{args.field}`: copy a folder into the case as a time "
                 "folder to view it in ParaView")
@@ -366,7 +363,9 @@ def cmd_fieldstats(args):
     print(f"  columns: {', '.join(names[1:])}")
     if phase:
         print("  (treated as a phase fraction" + (", blobs = separate regions with " + args.field + f" > {args.threshold})"
-                                                   if graph is not None else "; no ASCII polyMesh, so no blob count)"))
+                                                   if graph is not None else "; no blob count: " + (
+                                                       "droplets can cross processor boundaries in a decomposed case)"
+                                                       if foam.is_decomposed(case) else "no ASCII polyMesh)")))
     if not weighted:
         print("  note: no cell volumes (V) found, so cells are weighted equally; for exact volumes and means run"
               "  postProcess -func writeCellVolumes  in the case")
@@ -460,7 +459,8 @@ def cmd_sweep(args):
         rep.say(f"**{o}**: R2 = {fmt(m['r2'], 3)} ({verdict}); typical error {fmt(m['rmse'])}; most important input: "
                 f"{inputs[top[0]]}", summary=True)
     rep.table(["output", "R2 (1 = perfect)", "typical error", "inside +/-2 sigma (want ~95%)", "input importance"], trows)
-    rep.say("Input importance comes from how quickly each output changes with each input in the fitted model.")
+    rep.say("Input importance: Sobol total-effect indices of the fitted model over the sweep range, normalised to "
+            "100% (cfdml sensitivity gives the full indices with confidence intervals).")
     for o in outs:
         m = M.scalar[o]
         fig, ax = plt.subplots(1, 1 + len(inputs), figsize=(3.2 * (1 + len(inputs)), 3))
@@ -649,14 +649,11 @@ def cmd_gci(args):
 
 
 def cmd_steady(args):
-    from scipy import stats
-    from .verify import batch_means, transient_end
     tb = read_table(args.file)
     cols = args.column or [c for c in ("Cd", "Cl") if c in tb] or tb.value_names[:3]
     t = tb.time
     if len(t) < 100:
         raise CfdmlError(f"the file has only {len(t)} samples, up to t = {fmt(t[-1])}", hint="did the run finish?")
-    ends, periods = {}, {}
     ok = np.isfinite(t)
     for c in cols:
         ok &= np.isfinite(tb[c])
@@ -664,6 +661,15 @@ def cmd_steady(args):
         print(f"  note: skipped {(~ok).sum()} rows with missing values")
     t = t[ok]
     data = {c: tb[c][ok] for c in cols}
+    rep = _steady_core(args, t, data, cols, f"Is the run settled? {Path(args.file).name}", "cfdml_steady")
+    if rep is not None:
+        rep.close()
+
+
+def _steady_core(args, t, data, cols, title, out_default):
+    from scipy import stats
+    from .verify import batch_means, transient_end
+    ends, periods = {}, {}
     for c in cols:
         tu, yu, dt, _ = uniform(t, data[c])
         ends[c], periods[c] = transient_end(tu, yu)
@@ -672,9 +678,10 @@ def cmd_steady(args):
     if never and args.after is None:
         print(f"  {', '.join(never)} still changing at the end of the record (t = {fmt(t[-1])}): the run has not "
               "settled; run longer (or give --after to force statistics)")
-        return
+        return None
     t0 = args.after if args.after is not None else max(ends.values())
-    rep = Report(_out(args, "cfdml_steady"), f"Is the run settled? {Path(args.file).name}")
+    rep = Report(_out(args, out_default), title)
+    rep.t0, rep.period, rep.stats = t0, period, {}
     span = t[-1] - t[0]
     rep.say(f"record t = {fmt(t[0])} to {fmt(t[-1])}; " + (f"start-up transient ends at t = **{fmt(t0)}**"
             if args.after is None else f"statistics from t = {fmt(t0)} (given)") +
@@ -721,6 +728,7 @@ def cmd_steady(args):
         else:
             v = "settled"
         verdicts.append(v)
+        rep.stats[c] = dict(mean=m, ci=ci, std=sd, verdict=v)
         rows.append([c, fmt(m, 5), f"+/- {fmt(ci, 3)}" + (f" ({100 * rel:.2f}%)" if rel is not None else ""),
                      fmt(sd, 4), f"{drift:.1f}", v])
         rep.say(f"**{c}**: mean {fmt(m, 5)} +/- {fmt(ci, 3)} (95%), {v}", summary=True)
@@ -734,7 +742,7 @@ def cmd_steady(args):
     rep.say("Error bars from batch means (batches of at least two periods), so correlated samples are not counted "
             "as independent. Drift compares the first and second half of the settled part.")
     rep.figure(fig, "steady")
-    rep.close()
+    return rep
 
 
 def _load_xy(path, x, y):
@@ -809,4 +817,490 @@ def cmd_compare(args):
     ax[1].plot(X[inside], err[inside], "o", ms=4, color=COLORS[0])
     ax[1].set_xlabel(args.x); ax[1].set_ylabel("error %"); ax[1].set_title(f"band: +/-{args.tol:g}%")
     rep.figure(fig, "compare")
+    rep.close()
+
+
+def _end_time(case):
+    cd = Path(case) / "system/controlDict"
+    if cd.exists():
+        import re
+        m = re.search(r"^\s*endTime\s+([-+\d.eE]+)\s*;", cd.read_text(errors="replace"), re.M)
+        if m:
+            return float(m.group(1))
+    return None
+
+
+def cmd_residuals(args):
+    from .logs import find_residuals
+    R = find_residuals(args.path)
+    t = R["time"]
+    rep = Report(_out(args, "cfdml_residuals"), f"Residuals: {Path(R['source']).name}")
+    rep.say(f"source: `{R['source']}`; {len(t)} time steps, t = {fmt(t[0])} to {fmt(t[-1])}")
+    if R["fatal"]:
+        line, tf = R["fatal"]
+        rep.say(f"**the solver crashed** (line {line} of the log" + (f", at t = {fmt(tf)}" if tf is not None else "") + ")",
+                summary=True)
+        rep.lines += ["", "last lines of the log:", "", "```"] + R["tail"][-15:] + ["```", ""]
+        for ln in R["tail"][-6:]:
+            print("    | " + ln)
+    elif R["ended"]:
+        rep.say("the run finished (End)", summary=True)
+    elif R["ended"] is not None:
+        rep.say("no 'End' and no error: the run is still going, or was stopped", summary=True)
+    if R["nan"]:
+        rep.say(f"**NaN residuals** in {', '.join(R['nan'])}: the solution diverged", summary=True)
+    rows = []
+    steady_like = len(t) > 2 and np.allclose(np.diff(t[np.isfinite(t)]), 1)
+    for f, r in R["init"].items():
+        ok = np.isfinite(r) & (r > 0)
+        if not ok.any():
+            continue
+        rr = r[ok]
+        tail = rr[-max(len(rr) // 10, 1):]
+        drop = np.log10(rr[0] / np.median(tail)) if rr[0] > 0 else np.nan
+        lt = np.log10(rr[-max(len(rr) // 5, 2):])
+        slope = np.polyfit(np.arange(len(lt)), lt, 1)[0] * len(lt) if len(lt) > 2 else 0.0
+        trend = "still falling" if slope < -0.3 else ("rising" if slope > 0.3 else "flat")
+        it = R["iters"].get(f)
+        rows.append([f, fmt(rr[0], 3), fmt(float(np.median(tail)), 3), f"{drop:.1f}", trend,
+                     fmt(float(np.nanmean(it[-max(len(it) // 10, 1):])), 3) if it is not None and len(it) else "-"])
+    rep.table(["field", "first initial residual", "recent initial residual", "orders dropped", "last 20%",
+               "iterations per step (recent)"], rows)
+    worst = max(rows, key=lambda r: float(r[2])) if rows else None
+    if worst:
+        if steady_like:
+            ok = float(worst[3]) >= 3 and worst[4] != "rising"
+            rep.say(f"steady-state run: residuals dropped at least {min(float(r[3]) for r in rows):.1f} orders; "
+                    + ("converged by the usual 3-orders rule" if ok else
+                       f"{worst[0]} has not dropped 3 orders or is rising: not converged"), summary=True)
+        else:
+            rep.say(f"transient run: highest recent initial residual {worst[2]} ({worst[0]})"
+                    + ("; above 1e-3, consider more outer correctors or a smaller time step"
+                       if float(worst[2]) > 1e-3 else ""), summary=True)
+    co = R["co"][np.isfinite(R["co"])]
+    if co.size:
+        over = (co > 1).sum()
+        rep.say(f"Courant number: max {fmt(float(co.max()), 3)}, recent max {fmt(float(co[-1]), 3)}"
+                + (f"; above 1 in {over} of {co.size} steps" if over else ""), summary=True)
+    ico = R["ico"][np.isfinite(R["ico"])]
+    if ico.size:
+        rep.say(f"interface Courant number: max {fmt(float(ico.max()), 3)}", summary=True)
+    cont = R["cont"][np.isfinite(R["cont"])]
+    if cont.size:
+        rep.say(f"continuity error (sum local): recent {fmt(float(cont[-1]), 3)}, max {fmt(float(cont.max()), 3)}")
+    ex = R["exec"]
+    k = np.isfinite(ex)
+    if k.sum() > 10:
+        te, xe = t[k], ex[k]
+        rate = (xe[-1] - xe[max(0, len(xe) - len(xe) // 5 - 1)]) / max(te[-1] - te[max(0, len(te) - len(te) // 5 - 1)], 1e-300)
+        rep.say(f"wall time: {fmt(float(xe[-1]) / 3600, 3)} h so far, {fmt(rate, 3)} s per unit of simulated time recently")
+        tend = _end_time(Path(R["source"]).parent)
+        if tend and tend > te[-1] and not R["ended"]:
+            rep.say(f"at this speed, endTime {fmt(tend)} is reached in about {fmt((tend - te[-1]) * rate / 3600, 3)} h",
+                    summary=True)
+    fig, ax = plt.subplots(2 if co.size else 1, 1, figsize=(9, 5.5 if co.size else 3.2), squeeze=False, sharex=True)
+    for i, (f, r) in enumerate(R["init"].items()):
+        ax[0, 0].semilogy(t, r, lw=0.8, color=COLORS[i % len(COLORS)], label=f)
+    ax[0, 0].set_ylabel("initial residual"); ax[0, 0].legend(fontsize=7, ncol=6)
+    if co.size:
+        ax[1, 0].plot(t, R["co"], color="k", lw=0.8, label="Courant max")
+        if ico.size:
+            ax[1, 0].plot(t, R["ico"], color=COLORS[3], lw=0.8, label="interface Courant max")
+        ax[1, 0].axhline(1, color=COLORS[3], ls=":", lw=0.8); ax[1, 0].set_ylabel("Courant"); ax[1, 0].legend(fontsize=7)
+    ax[-1, 0].set_xlabel("time" if not steady_like else "iteration")
+    rep.figure(fig, "residuals")
+    with open(rep.out / "residuals.csv", "w", newline="") as fh:
+        w = csv.writer(fh)
+        names = list(R["init"])
+        w.writerow(["time"] + names + ["courant_max"])
+        for j in range(len(t)):
+            w.writerow([t[j]] + [R["init"][n][j] for n in names] + [R["co"][j]])
+    rep.close()
+
+
+def _find_force_file(path):
+    p = Path(path)
+    if p.is_file() or (p.is_dir() and not (p / "system").is_dir()):
+        return p
+    cands = sorted({f.parent.parent for f in p.glob("postProcessing/*/*/force*.dat")})
+    if not cands:
+        raise CfdmlError(f"no forces function object output in {p}/postProcessing",
+                         hint="add a forces function object to system/controlDict")
+    if len(cands) > 1:
+        print("  several force outputs found, using the first: " + ", ".join(c.name for c in cands))
+    return cands[0]
+
+
+def cmd_forces(args):
+    from .forces import read_forces
+    src = _find_force_file(args.path)
+    F = read_forces(src)
+    d, l = args.drag, args.lift
+    t = F["time"]
+    coeff = args.rho and args.velocity and args.area
+    q = 0.5 * args.rho * args.velocity ** 2 * args.area if coeff else 1.0
+    names = ("Cd", "Cl") if coeff else (f"F{d}", f"F{l}")
+    data = {names[0]: F[f"total_{d}"] / q, names[1]: F[f"total_{l}"] / q}
+    if "pressure_x" in F:
+        data[names[0] + "_pressure"] = F[f"pressure_{d}"] / q
+        data[names[0] + "_viscous"] = F[f"viscous_{d}"] / q
+    out = _out(args, "cfdml_forces")
+    Path(out).mkdir(parents=True, exist_ok=True)
+    with open(Path(out) / "forces.csv", "w", newline="") as fh:
+        w = csv.writer(fh); w.writerow(["time"] + list(data))
+        w.writerows(zip(t, *data.values()))
+    print(f"  {len(t)} samples from {src}; time series saved as {out}/forces.csv")
+    if not coeff:
+        print("  give --rho, -U and --area to get coefficients (Cd, Cl) instead of forces")
+    rep = _steady_core(args, t, data, list(names), f"Forces: {Path(src).name}", "cfdml_forces")
+    if rep is None:
+        return
+    k = t >= rep.t0
+    if names[0] + "_pressure" in data and rep.stats.get(names[0]):
+        mp, mv = data[names[0] + "_pressure"][k].mean(), data[names[0] + "_viscous"][k].mean()
+        tot = mp + mv
+        if tot:
+            rep.say(f"drag split: pressure {100 * mp / tot:.1f}%, viscous {100 * mv / tot:.1f}%", summary=True)
+    lift = data[names[1]][k]
+    if lift.std() > 1e-9 * max(1.0, abs(lift.mean())):
+        tu, yu, dt, _ = uniform(t[k], lift)
+        sp = spectrum(yu, dt)
+        rep.say(f"{names[1]}: rms {fmt(float(np.sqrt(np.mean((yu - yu.mean()) ** 2))), 4)}, frequency {fmt(sp['f0'])}"
+                + (f", St = {fmt(sp['f0'] * args.length / args.velocity)}" if args.length and args.velocity else ""),
+                summary=True)
+    rep.close()
+
+
+def _transient_from_case(case):
+    from .verify import transient_end
+    files = sorted(Path(case).glob("postProcessing/*/*/coefficient.dat")) + sorted(Path(case).glob("postProcessing/*/*/force*.dat"))
+    for f in files:
+        try:
+            if f.name == "coefficient.dat":
+                tb = read_table(f.parent.parent)
+                col = "Cl" if "Cl" in tb else tb.value_names[0]
+                t, y = tb.time, tb[col]
+            else:
+                from .forces import read_forces
+                F = read_forces(f.parent.parent)
+                t, y = F["time"], F["total_y"]
+            tu, yu, _, _ = uniform(t, y)
+            te, _ = transient_end(tu, yu)
+            if te is None:
+                raise CfdmlError(f"the forces in {f.parent.parent} are still changing at the end of the run",
+                                 hint="the run has not settled; give --after explicitly to average anyway")
+            return te, f
+        except CfdmlError as e:
+            if "still changing" in str(e):
+                raise
+            continue
+    raise CfdmlError("--after auto needs forces or forceCoeffs output in postProcessing to find the transient",
+                     hint="give --after <time> instead")
+
+
+def cmd_average(args):
+    case = Path(args.case)
+    _check_case(case)
+    after = args.after
+    if after == "auto":
+        after, src = _transient_from_case(case)
+        print(f"  transient ends at t = {fmt(after)} (from {src.relative_to(case)})")
+    elif after is not None:
+        after = float(after)
+    nc = foam.n_cells(case)
+    rep = Report(_out(args, "cfdml_average"), f"Time averages in {case.name}")
+    for field in args.field:
+        ts = [(t, d) for t, d in foam.times(case, [field])
+              if (after is None or t >= after) and (args.before is None or t <= args.before)][::args.every]
+        if len(ts) < 2:
+            raise CfdmlError(f"found {len(ts)} time folders with '{field}' in the window; need at least 2",
+                             hint="fields found: " + ", ".join(sorted(foam.field_names(case))))
+        print(f"  averaging {field} over {len(ts)} time folders ...")
+        n, mean, m2, half = 0, None, None, None
+        for i, (_, d) in enumerate(ts):
+            x = foam.read_field(d / field, nc)
+            x = x.reshape(nc, -1)
+            if mean is None:
+                mean = np.zeros_like(x); m2 = np.zeros((nc, x.shape[1], x.shape[1]))
+            n += 1
+            delta = x - mean
+            mean += delta / n
+            m2 += delta[:, :, None] * (x - mean)[:, None, :]
+            if i == len(ts) // 2 - 1:
+                half = mean.copy()
+        cov = m2 / max(n - 1, 1)
+        k = mean.shape[1]
+        mfield = mean[:, 0] if k == 1 else mean
+        if k == 1:
+            pfield = cov[:, 0, 0]
+        else:
+            iu = [(0, 0), (0, 1), (0, 2), (1, 1), (1, 2), (2, 2)] if k == 3 else [(i, j) for i in range(k) for j in range(i, k)]
+            pfield = np.stack([cov[:, i, j] for i, j in iu], 1)
+        tl = ts[-1][1].name
+        hdr = foam.field_header(ts[-1][1] / field)
+        mean_name, p_name = f"{field}Mean", f"{field}Prime2Mean"
+        hdr_p = dict(hdr, cls="volSymmTensorField" if k == 3 else hdr["cls"],
+                     dims=_square_dims(hdr["dims"]))
+        for into in ([False, True] if args.into_case else [False]):
+            for nm, val, h in ((mean_name, mfield, hdr), (p_name, pfield, hdr_p)):
+                fp = ts[-1][1] / nm if into else foam.out_target(case, rep.out, tl, nm)
+                if into and fp.exists() and not args.force:
+                    raise CfdmlError(f"{fp} already exists", hint="add --force to overwrite it")
+                foam.write_field(fp, nm, val, _calc_boundary(h),
+                                 note=f"cfdml average: {len(ts)} snapshots, t = {fmt(ts[0][0])} to {fmt(ts[-1][0])}")
+        change = float(np.linalg.norm(mean - half) / max(np.linalg.norm(mean - mean.mean(0)), 1e-300)) if half is not None else np.nan
+        rep.say(f"**{field}**: {len(ts)} snapshots from t = {fmt(ts[0][0])} to {fmt(ts[-1][0])}; wrote {mean_name} and "
+                f"{p_name}" + (f" into the case ({tl}/)" if args.into_case else f" to {rep.out.name}/{tl}/"), summary=True)
+        rep.say(f"  the mean after half the snapshots differs from the final mean by {100 * change:.1f}% "
+                + ("(well converged)" if change < 0.02 else "(average over a longer time for a converged mean)"
+                   if change > 0.05 else "(acceptable)"), summary=True)
+        C, axes = _centres_2d(case)
+        if C is not None:
+            s = _slab(C, axes)
+            fig, ax = plt.subplots(1, 2, figsize=(10, 3.2))
+            mag = np.linalg.norm(mean, axis=1) if k > 1 else mean[:, 0]
+            rms = np.sqrt(np.trace(cov, axis1=1, axis2=2) / k)
+            tc = _field_plot(ax[0], C[s], axes, mag[s], f"{mean_name}" + (" magnitude" if k > 1 else ""),
+                             cmap="viridis", sym=False)
+            plt.colorbar(tc, ax=ax[0], shrink=0.8)
+            tc = _field_plot(ax[1], C[s], axes, rms[s], f"rms fluctuation of {field}", cmap="magma", sym=False)
+            plt.colorbar(tc, ax=ax[1], shrink=0.8)
+            rep.figure(fig, f"average_{field}")
+    rep.close()
+
+
+def _square_dims(d):
+    try:
+        v = [float(x) for x in d.strip("[]").split()]
+        return "[" + " ".join(f"{2 * x:g}" for x in v) + "]"
+    except ValueError:
+        return d
+
+
+def _calc_boundary(h):
+    zero = {"volVectorField": "(0 0 0)", "volSymmTensorField": "(0 0 0 0 0 0)", "volTensorField": "(0 0 0 0 0 0 0 0 0)"}
+    z = zero.get(h["cls"], "0")
+    return dict(h, boundary="boundaryField\n{\n    \".*\"\n    {\n        type calculated;\n        value uniform "
+                + z + ";\n    }\n}\n")
+
+
+def _slab(C, axes):
+    third = ({0, 1, 2} - set(axes)).pop()
+    span = np.ptp(C, 0)
+    if span[third] <= 0.05 * max(span[axes[0]], span[axes[1]]):
+        return np.ones(len(C), bool)
+    mid = np.median(C[:, third])
+    width = np.sort(np.abs(C[:, third] - mid))[min(len(C) - 1, max(len(C) // 50, 100))]
+    return np.abs(C[:, third] - mid) <= width
+
+
+def cmd_sensitivity(args):
+    from .sweep import sobol
+    M = load_model(args.model)
+    if len(M.inputs) < 2:
+        raise CfdmlError("sensitivity indices need at least two inputs")
+    outs = args.output or list(M.scalar)
+    rep = Report(_out(args, "cfdml_sensitivity"), "Sobol sensitivity indices")
+    rep.say(f"inputs sampled uniformly over the sweep range (log-uniform for {', '.join(k for k, l in zip(M.inputs, M.scaler.log) if l) or 'none'}); "
+            f"{args.n} base samples through the fitted Gaussian-process mean; 95% intervals by bootstrap")
+    fig, ax = plt.subplots(1, len(outs), figsize=(3.6 * len(outs) + 0.6, 3), squeeze=False)
+    for a, o in zip(ax[0], outs):
+        if o not in M.scalar:
+            raise CfdmlError(f"no output '{o}' in the model", hint="outputs: " + ", ".join(M.scalar))
+        S = sobol(M, o, n=args.n)
+        rows = [[k, f"{S['S1'][i]:.3f} [{S['S1_ci'][0][i]:.3f}, {S['S1_ci'][1][i]:.3f}]",
+                 f"{S['ST'][i]:.3f} [{S['ST_ci'][0][i]:.3f}, {S['ST_ci'][1][i]:.3f}]"] for i, k in enumerate(M.inputs)]
+        rep.say(f"### {o}  (leave-one-out R2 of the model {fmt(M.scalar[o]['r2'], 3)})")
+        rep.table(["input", "first order S1", "total ST"], rows)
+        inter = 1 - S["S1"].sum()
+        rep.say(f"**{o}**: " + ", ".join(f"{k} {S['ST'][i]:.2f}" for i, k in enumerate(M.inputs))
+                + f" (total effect); interactions carry {max(inter, 0):.0%} of the variance", summary=True)
+        x = np.arange(len(M.inputs))
+        a.bar(x - 0.18, S["S1"], 0.36, color=COLORS[0], label="first order",
+              yerr=np.abs(S["S1_ci"] - S["S1"]), capsize=2, error_kw=dict(lw=0.7))
+        a.bar(x + 0.18, S["ST"], 0.36, color=COLORS[1], label="total",
+              yerr=np.abs(S["ST_ci"] - S["ST"]), capsize=2, error_kw=dict(lw=0.7))
+        a.set_xticks(x); a.set_xticklabels(M.inputs); a.set_ylim(0, 1.05); a.set_title(o)
+        if M.scalar[o]["r2"] < 0.8:
+            rep.say(f"  the model of {o} is not accurate (R2 {fmt(M.scalar[o]['r2'], 3)}), so treat these indices "
+                    "as rough", summary=True)
+    ax[0, 0].legend(fontsize=7)
+    rep.say("S1: share of the output variance from that input alone. ST: including all its interactions. "
+            "ST - S1 large means the input matters mostly through interactions.")
+    rep.figure(fig, "sensitivity")
+    rep.close()
+
+
+def _constraint(text, outputs):
+    import re
+    m = re.match(r"^\s*([\w.()]+)\s*(<=|>=|<|>)\s*([-+\d.eE]+)\s*$", text)
+    if not m:
+        raise CfdmlError(f"cannot read constraint '{text}'", hint="write it like  St<=0.21  or  Cl_amp>=0.5")
+    name, op, v = m.group(1), m.group(2), float(m.group(3))
+    if name not in outputs:
+        raise CfdmlError(f"constraint on unknown output '{name}'", hint="outputs: " + ", ".join(outputs))
+    return name, op.startswith("<"), v
+
+
+def cmd_optimize(args):
+    from scipy.optimize import minimize
+    from scipy.stats import norm
+    from .sweep import sample_inputs
+    M = load_model(args.model)
+    goal = args.minimize or args.maximize
+    if not goal or (args.minimize and args.maximize):
+        raise CfdmlError("give exactly one of --minimize or --maximize", hint="e.g.  --minimize Cd")
+    if goal not in M.scalar:
+        raise CfdmlError(f"no output '{goal}' in the model", hint="outputs: " + ", ".join(M.scalar))
+    sign = 1 if args.minimize else -1
+    cons = [_constraint(c, list(M.scalar)) for c in args.subject_to or []]
+    fixed = {}
+    for f in args.fix or []:
+        k, v = f.split("=")
+        if k not in M.inputs:
+            raise CfdmlError(f"unknown input '{k}' in --fix", hint="inputs: " + ", ".join(M.inputs))
+        fixed[M.inputs.index(k)] = float(v)
+    free = [j for j in range(len(M.inputs)) if j not in fixed]
+    log = M.scaler.log
+
+    lo2, hi2 = M.lo.astype(float).copy(), M.hi.astype(float).copy()
+    lo2[log], hi2[log] = np.log(lo2[log]), np.log(hi2[log])
+
+    def to_x(u):
+        x = np.empty(len(M.inputs))
+        for j, v in fixed.items():
+            x[j] = v
+        for i, j in enumerate(free):
+            val = lo2[j] + min(max(u[i], 0.0), 1.0) * (hi2[j] - lo2[j])
+            x[j] = np.exp(val) if log[j] else val
+        return x
+
+    def pfeas(pred, i=None):
+        p = np.ones_like(pred[goal][0])
+        for name, le, v in cons:
+            mu, sd = pred[name]
+            z = (v - mu) / np.maximum(sd, 1e-12)
+            p = p * (norm.cdf(z) if le else norm.cdf(-z))
+        return p
+
+    rng = np.random.default_rng(0)
+    X = sample_inputs(M, 20000, rng, fixed)
+    pred = M.predict(X)
+    obj, pf = sign * pred[goal][0], pfeas(pred)
+    feas = pf >= args.confidence
+    if not feas.any():
+        best = int(np.argmax(pf))
+        raise CfdmlError(f"no point in the sweep range meets the constraints with {args.confidence:.0%} confidence "
+                         f"(best is {pf[best]:.0%})", hint="relax the constraints, lower --confidence, or run more cases "
+                                                            "where they are met")
+    starts = np.argsort(np.where(feas, obj, np.inf))[:8]
+
+    def penalised(u):
+        x = to_x(u)[None]
+        pr = M.predict(x)
+        return float(sign * pr[goal][0][0] + 1e3 * max(0.0, args.confidence - pfeas(pr)[0]))
+
+    def to_u(x):
+        return np.array([((np.log(x[j]) if log[j] else x[j]) - lo2[j]) / ((hi2[j] - lo2[j]) or 1.0) for j in free])
+
+    def objective(u):
+        return float(sign * M.predict(to_x(u)[None])[goal][0][0])
+
+    def margin(u):
+        return float(pfeas(M.predict(to_x(u)[None]))[0] - args.confidence)
+
+    best_u, best_f = None, np.inf
+    for s in starts:
+        if not free:
+            break
+        u0 = to_u(X[s])
+        if cons:
+            r = minimize(objective, u0, method="SLSQP", bounds=[(0, 1)] * len(free),
+                         constraints=[dict(type="ineq", fun=margin)], options=dict(maxiter=200, ftol=1e-10))
+            if margin(r.x) < -1e-6:
+                continue
+            f = objective(r.x)
+        else:
+            r = minimize(penalised, u0, method="L-BFGS-B", bounds=[(0, 1)] * len(free))
+            f = r.fun
+        if f < best_f:
+            best_u, best_f = np.clip(r.x, 0, 1), f
+    if free and best_u is None:
+        best_u = to_u(X[starts[0]])
+    xb = to_x(best_u) if free else X[starts[0]]
+    pb = M.predict(xb[None])
+    rep = Report(_out(args, f"cfdml_optimize_{goal}"), f"{'Minimise' if args.minimize else 'Maximise'} {goal}")
+    rep.say("searched the sweep range on the fitted Gaussian processes" + (f", with {', '.join(args.subject_to)} required at "
+            f"{args.confidence:.0%} confidence" if cons else "") + (f"; fixed {', '.join(args.fix)}" if fixed else ""))
+    rep.say("optimum (predicted): " + ", ".join(f"{k}={fmt(v)}" for k, v in zip(M.inputs, xb)), summary=True)
+    rep.say(f"  {goal} = {fmt(pb[goal][0][0], 5)} +/- {fmt(2 * pb[goal][1][0], 3)} (2 sigma)", summary=True)
+    for name, le, v in cons:
+        mu, sd = pb[name]
+        p = norm.cdf((v - mu[0]) / max(sd[0], 1e-12)) if le else norm.cdf((mu[0] - v) / max(sd[0], 1e-12))
+        rep.say(f"  {name} = {fmt(mu[0], 5)} +/- {fmt(2 * sd[0], 3)} ({p:.0%} chance of {name} {'<=' if le else '>='} {fmt(v)})",
+                summary=True)
+    edge = [k for j, k in enumerate(M.inputs) if j in free and (np.isclose(xb[j], M.lo[j], rtol=1e-3) or
+                                                               np.isclose(xb[j], M.hi[j], rtol=1e-3))]
+    if edge:
+        rep.say(f"  the optimum sits on the edge of the sweep range in {', '.join(edge)}: the true optimum may lie "
+                "outside it; extend the sweep in that direction", summary=True)
+    y = M.scalar[goal]["y"]
+    have = M.scalar[goal]["have"]
+    Xr = M.X[have]
+    pr = M.predict(Xr)
+    ok_runs = pfeas(pr) >= 0.5
+    for j, v in fixed.items():
+        ok_runs &= np.isclose(Xr[:, j], v, rtol=0.02)
+    if ok_runs.any():
+        i = int(np.argmin(np.where(ok_runs, sign * y, np.inf)))
+        rep.say("best run you already have: " + ", ".join(f"{k}={fmt(v)}" for k, v in zip(M.inputs, Xr[i]))
+                + f", {goal} = {fmt(y[i], 5)}", summary=True)
+        fbest = sign * y[i]
+        mu, sd = pred[goal]
+        z = (fbest - sign * mu) / np.maximum(sd, 1e-12)
+        ei = (fbest - sign * mu) * norm.cdf(z) + sd * norm.pdf(z)
+        score = ei * pf
+        j = int(np.argmax(score))
+    if ok_runs.any():
+        rep.say("run to do next (largest expected improvement that meets the constraints): "
+                + ", ".join(f"{k}={fmt(v)}" for k, v in zip(M.inputs, X[j])), summary=True)
+    rep.say("Predictions come from the surrogate. Confirm the optimum with a CFD run before relying on it.")
+    if len(free) in (1, 2):
+        fig, ax = plt.subplots(figsize=(5.5, 3.6))
+        if len(free) == 1:
+            j = free[0]
+            g = np.linspace(0, 1, 300)
+            Xg = np.array([to_x(np.array([u])) for u in g])
+            pg = M.predict(Xg)
+            mu, sd = pg[goal]
+            ok = pfeas(pg) >= args.confidence
+            ax.fill_between(Xg[:, j], mu - 2 * sd, mu + 2 * sd, color=COLORS[0], alpha=0.2, lw=0)
+            ax.plot(Xg[:, j], np.where(ok, mu, np.nan), color=COLORS[0], label="meets constraints")
+            ax.plot(Xg[:, j], np.where(ok, np.nan, mu), color="#bbbbbb", label="violates")
+            ax.plot(xb[j], pb[goal][0][0], "*", ms=14, color=COLORS[3], label="optimum")
+            ax.set_xlabel(M.inputs[j]); ax.set_ylabel(goal); ax.legend(fontsize=7)
+            if log[j]:
+                ax.set_xscale("log")
+        else:
+            a, b = free
+            g = np.linspace(0, 1, 70)
+            U1, U2 = np.meshgrid(g, g)
+            Xg = np.array([to_x(np.array([p, q])) for p, q in zip(U1.ravel(), U2.ravel())])
+            pg = M.predict(Xg)
+            mu = pg[goal][0].reshape(U1.shape)
+            ok = (pfeas(pg) >= args.confidence).reshape(U1.shape)
+            A, B = Xg[:, a].reshape(U1.shape), Xg[:, b].reshape(U1.shape)
+            c = ax.contourf(A, B, mu, levels=30, cmap="viridis")
+            plt.colorbar(c, ax=ax, label=goal)
+            if cons:
+                ax.contourf(A, B, (~ok).astype(float), levels=[0.5, 1.5], colors="none", hatches=["////"])
+            ax.plot(M.X[:, a], M.X[:, b], "w.", mec="k", ms=6)
+            ax.plot(xb[a], xb[b], "*", ms=16, color=COLORS[3], mec="w")
+            ax.set_xlabel(M.inputs[a]); ax.set_ylabel(M.inputs[b])
+            ax.set_title("hatched: constraints not met" if cons else goal)
+            if log[a]:
+                ax.set_xscale("log")
+            if log[b]:
+                ax.set_yscale("log")
+        rep.figure(fig, "optimize")
     rep.close()
