@@ -334,7 +334,7 @@ def test_sweep_robustness(demo, tmp_path, capsys):
     runs = [i for i, ln in enumerate(lines) if ln.strip().startswith("- {case")]
     for i in runs[:2]:
         lines[i] = lines[i].replace("}", ", Cm: 0.1}")
-    cfg = "\n".join(lines)
+    cfg = "\n".join(lines).replace("outputs:", "outputs:\n  Cm: {}")
     (demo / "s2.yaml").write_text(cfg)
     assert main(["sweep", str(demo / "s2.yaml"), "-o", str(tmp_path / "w")]) == 0
     assert "Cm left out" in capsys.readouterr().out
