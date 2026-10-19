@@ -52,7 +52,11 @@ def read_forces(path):
         comments, rows = _rows(f)
         if not rows:
             continue
-        width = min(len(r) for r in rows)
+        lengths = np.array([len(r) for r in rows])
+        width = int(np.bincount(lengths).argmax())
+        if (lengths < width).any():
+            print(f"  warning: {f.name}: {(lengths < width).sum()} incomplete row(s) skipped")
+        rows = [r for r in rows if len(r) >= width]
         names = _names(comments, width)
         if names is None:
             raise CfdmlError(f"cannot recognise the force file layout of {f}",

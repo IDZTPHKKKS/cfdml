@@ -1,3 +1,4 @@
+import csv
 import re
 from pathlib import Path
 
@@ -41,9 +42,15 @@ class Table:
         return [n for n in self.names if n != tn]
 
 
+_MISSING = {"", "nan", "NaN", "N/A", "n/a", "NA", "-"}
+
+
 def _split(line):
+    if "," in line:
+        toks = next(csv.reader([line.replace("(", " ").replace(")", " ")]))
+        return [t.strip() for t in toks]
     line = line.replace("(", " ").replace(")", " ")
-    return [x for x in re.split(r"[,\s;]+", line.strip()) if x]
+    return [x for x in re.split(r"[\s;]+", line.strip()) if x]
 
 
 def _is_number(x):
@@ -72,9 +79,9 @@ def read_table(path):
                          if dats else None)
     if not path.exists():
         raise CfdmlError(f"file not found: {path}")
-    comments, rows, header = [], [], None
+    comments, rows, header, lines_no = [], [], None, []
     vector_cols = None
-    for line in path.read_text(errors="replace").splitlines():
+    for n, line in enumerate(path.read_text(errors="replace").splitlines(), 1):
         s = line.strip()
         if not s:
             continue
@@ -82,18 +89,31 @@ def read_table(path):
             comments.append(s.lstrip("#% ").strip())
             continue
         toks = _split(s)
-        if not all(_is_number(t) for t in toks):
+        if "," in s:
+            toks = [t for tok in toks for t in (tok.split() or [""])]
+        if not all(_is_number(t) or t in _MISSING for t in toks) or all(t in _MISSING for t in toks):
             if not rows:
-                header = [t for t in re.split(r"[,\t;]+|\s{2,}", s.strip().strip(",")) if t] if ("," in s or "\t" in s) \
-                    else s.split()
+                if "," in s:
+                    header = [t.strip() for t in next(csv.reader([s])) if t.strip()]
+                else:
+                    header = [t for t in re.split(r"[\t;]+|\s{2,}", s.strip()) if t] if "\t" in s else s.split()
             continue
         if vector_cols is None:
             vector_cols = [len(t.split()) for t in re.findall(r"\(([^()]*)\)", s)]
-        rows.append([float(t) for t in toks])
+        rows.append([float(t) if t not in _MISSING else np.nan for t in toks])
+        lines_no.append(n)
     if not rows:
         raise CfdmlError(f"no numeric rows in {path}")
-    width = min(len(r) for r in rows)
-    data = np.array([r[:width] for r in rows])
+    lengths = np.array([len(r) for r in rows])
+    width = int(np.bincount(lengths).argmax())
+    short = np.nonzero(lengths < width)[0]
+    if short.size:
+        print(f"  warning: {path.name}: {short.size} row(s) have fewer than {width} values and were skipped "
+              f"(first at line {lines_no[short[0]]}" + ("; the file may have been cut off while being written)"
+                                                          if short[-1] == len(rows) - 1 else ")"))
+    if (lengths > width).any():
+        print(f"  warning: {path.name}: {(lengths > width).sum()} row(s) have more than {width} values; extra values ignored")
+    data = np.array([r[:width] for r, L in zip(rows, lengths) if L >= width])
     names = header
     if names is None and comments:
         probe_lines = [c for c in comments if re.match(r"Probe\s+\d+\s*\(", c)]

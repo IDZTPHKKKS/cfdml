@@ -292,3 +292,14 @@ def test_optimize_and_sensitivity(demo, tmp_path, capsys):
     assert main(["optimize", o + "/w", "--minimize", "Cd", "--subject-to", "St>=0.5", "-o", o + "/op2"]) == 1
     assert main(["sensitivity", o + "/w", "-n", "1024", "-o", o + "/s"]) == 0
     assert "Cd" in (tmp_path / "s/report.md").read_text()
+
+
+def test_truncated_and_quoted_tables(demo, tmp_path, capsys):
+    src = (demo / "wake/postProcessing/forceCoeffs/0/coefficient.dat").read_text()
+    (tmp_path / "cut.dat").write_text(src + "120.05\t1.3")
+    tb = read_table(tmp_path / "cut.dat")
+    assert "Cl" in tb and tb.data.shape[1] == 8 and tb.time[-1] == 120
+    assert "cut off" in capsys.readouterr().out
+    (tmp_path / "q.csv").write_text('time,"Cd, mean",Cl\n0,1.0,0.1\n1,,0.2\n2,1.2,N/A\n')
+    tb = read_table(tmp_path / "q.csv")
+    assert tb.names == ["time", "Cd, mean", "Cl"] and np.isnan(tb["Cd, mean"][1]) and np.isnan(tb["Cl"][2])
