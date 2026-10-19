@@ -343,3 +343,24 @@ def test_sweep_robustness(demo, tmp_path, capsys):
     assert main(["predict", str(tmp_path / "w"), "--grid", "Re=100:1000:3", "--grid", "angle=0:0:1",
                  "-o", str(tmp_path / "p")]) == 0
     assert "316.2" in (tmp_path / "p/predictions.csv").read_text()
+
+
+def test_cli_fixes(demo, tmp_path, capsys):
+    o = tmp_path
+    (o / "r.csv").write_text("Re,St\n60,0\n100,0.1643\n150,0.1849\n")
+    from cfdml.verify import REFERENCES
+    REFERENCES["zero-test"] = dict(x="Re", y="St", lo=0, hi=200, f=lambda r: np.where(r < 80, 0.0, 0.1643 + 0 * r),
+                                   cite="test")
+    assert main(["compare", str(o / "r.csv"), "-x", "Re", "-y", "St", "--ref", "zero-test", "-o", str(o / "c")]) == 0
+    assert "nan%" not in capsys.readouterr().out
+    del REFERENCES["zero-test"]
+    (o / "e.csv").write_text("Re,St\n1,\n")
+    assert main(["compare", str(o / "e.csv"), "-x", "Re", "-y", "St", "--ref", "cylinder-st-fey"]) == 1
+    assert main(["info", str(demo / "wake"), "--debug"]) == 0
+    t = np.arange(0, 200, 0.05)
+    (o / "g.csv").write_text("time,Cl\n" + "".join(f"{a},{np.exp(a / 40) * np.sin(a)}\n" for a in t))
+    assert main(["steady", str(o / "g.csv"), "-o", str(o / "s")]) == 3
+    assert (o / "s/report.md").exists()
+    assert main(["spectrum", str(o / "g.csv"), "-o", str(o / "s")]) == 1
+    assert main(["spectrum", str(o / "g.csv"), "-o", str(o / "s"), "--overwrite"]) == 0
+    assert main(["fieldstats", str(demo / "wake"), "-f", "U", "--phase", "-o", str(o / "fs")]) == 1

@@ -31,6 +31,23 @@ def _read_text(path):
     return raw.decode("latin-1")
 
 
+def check_format(path):
+    if isinstance(path, ProcField):
+        path = path.paths[0]
+    path = Path(path)
+    if not path.exists() and Path(str(path) + ".gz").exists():
+        path = Path(str(path) + ".gz")
+    if not path.exists():
+        raise CfdmlError(f"file not found: {path}")
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rb") as fh:
+        head = fh.read(2000).decode("latin-1")
+    if re.search(r"format\s+binary", head):
+        raise CfdmlError(f"{path} is written in binary format, which cfdml cannot read",
+                         hint="convert the case to ASCII once with:  foamFormatConvert  (run inside the case folder), "
+                              "or set  writeFormat ascii;  in system/controlDict")
+
+
 def _strip_comments(text):
     text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
     return re.sub(r"//[^\n]*", " ", text)
@@ -144,6 +161,8 @@ def n_cells(case):
         if m:
             return int(m.group(1))
         body, n, _ = _read_list(owner)
+        if n == 0 or not body.split():
+            raise CfdmlError(f"{owner} is empty", hint="the mesh looks broken; rerun blockMesh or the mesher")
         return int(np.array(body.split(), int).max()) + 1
     for _, d in _time_dirs(case):
         for f in sorted(d.iterdir()):
@@ -216,7 +235,12 @@ def write_field(path, name, values, header, note=""):
         return
     values = np.asarray(values)
     vec = values.ndim == 2
-    kind = {1: "scalar", 3: "vector", 6: "symmTensor", 9: "tensor"}[values.shape[1] if vec else 1]
+    if vec and values.shape[1] == 2:
+        values = np.c_[values, np.zeros(len(values))]
+    kinds = {1: "scalar", 3: "vector", 6: "symmTensor", 9: "tensor"}
+    if (values.shape[1] if vec else 1) not in kinds:
+        raise CfdmlError(f"cannot write a field with {values.shape[1]} components")
+    kind = kinds[values.shape[1] if vec else 1]
     lines = [f"({' '.join(f'{x:.8g}' for x in row)})" for row in values] if vec else [f"{x:.8g}" for x in values]
     text = ("FoamFile\n{\n    version 2.0;\n    format ascii;\n    class " + header["cls"] + ";\n    object " + name
             + ";\n}\n" + (f"// {note}\n" if note else "") + f"dimensions {header['dims']};\n\n"

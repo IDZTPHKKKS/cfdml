@@ -12,10 +12,27 @@ plt.rcParams.update({"font.size": 9, "axes.titlesize": 9, "savefig.dpi": 160, "f
 COLORS = ["#4c72b0", "#dd8452", "#55a868", "#c44e52", "#8172b3", "#937860"]
 
 
+COMMAND = {"name": None, "overwrite": False}
+
+
+def claim(out):
+    out = Path(out)
+    mark = out / ".cfdml"
+    name = COMMAND["name"] or "cfdml"
+    if out.exists() and any(out.iterdir()) and not COMMAND["overwrite"]:
+        owner = mark.read_text().strip() if mark.exists() else None
+        if owner != name:
+            from .errors import CfdmlError
+            raise CfdmlError(f"{out} already holds " + (f"output of  cfdml {owner}" if owner else "other files"),
+                             hint="choose another folder with -o, or add --overwrite")
+    out.mkdir(parents=True, exist_ok=True)
+    mark.write_text(name + "\n")
+    return out
+
+
 class Report:
     def __init__(self, out, title):
-        self.out = Path(out)
-        self.out.mkdir(parents=True, exist_ok=True)
+        self.out = claim(out)
         self.lines = [f"# {title}", ""]
         self.summary = []
 

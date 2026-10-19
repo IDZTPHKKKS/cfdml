@@ -38,6 +38,8 @@ def build():
         s = sub.add_parser(name, help=help_.replace("%", "%%"), description=help_)
         s.set_defaults(fn=fn)
         s.add_argument("-o", "--out", help="output folder (default: cfdml_<command>_... in the current folder)")
+        s.add_argument("--overwrite", action="store_true", help="write into an output folder that holds other files")
+        s.add_argument("--debug", action="store_true", dest="debug_sub", help="show full Python errors")
         return s
 
     from . import commands as C
@@ -174,8 +176,11 @@ def main(argv=None):
     if not getattr(args, "fn", None):
         ap.print_help()
         return 0
+    from .report import COMMAND
+    COMMAND.update(name=args.cmd, overwrite=getattr(args, "overwrite", False))
+    debug = args.debug or getattr(args, "debug_sub", False)
     try:
-        args.fn(args)
+        rc = args.fn(args)
     except CfdmlError as e:
         print(f"\ncfdml: {e}", file=sys.stderr)
         if e.hint:
@@ -184,13 +189,17 @@ def main(argv=None):
     except KeyboardInterrupt:
         print("\ncfdml: stopped", file=sys.stderr)
         return 130
+    except MemoryError:
+        print("\ncfdml: ran out of memory", file=sys.stderr)
+        print("  hint: use --every, --box or a shorter time window to read less data", file=sys.stderr)
+        return 1
     except Exception as e:
-        if args.debug:
+        if debug:
             raise
         print(f"\ncfdml: unexpected error: {type(e).__name__}: {e}", file=sys.stderr)
         print("  rerun with --debug for the full error, and send it to whoever maintains cfdml", file=sys.stderr)
         return 2
-    return 0
+    return rc if isinstance(rc, int) else 0
 
 
 if __name__ == "__main__":

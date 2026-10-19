@@ -38,6 +38,16 @@ def _series(path, column, after=None, before=None):
 
 def info(args):
     p = Path(args.path)
+    if p.is_dir() and (p / "system").is_dir() and foam.is_decomposed(p):
+        procs = foam._proc_dirs(p)
+        ts = foam.times(p)
+        print(f"OpenFOAM case (decomposed into {len(procs)} processors): {p}")
+        print(f"  cells: {foam.n_cells(p)}")
+        print(f"  time folders: {len(ts)}" + (f"  ({fmt(ts[0][0])} ... {fmt(ts[-1][0])})" if ts else ""))
+        for name, n in sorted(foam.field_names(p).items()):
+            print(f"  field {name:<12} in {n} time folder(s)")
+        print("  cfdml reads the processor folders directly; reconstructPar is not needed")
+        return
     if foam.is_case(p):
         nc = foam.n_cells(p)
         ts = foam.times(p)
@@ -117,7 +127,7 @@ def _case_snapshots(args):
     if args.every > 1:
         ts = ts[::args.every]
     if ts:
-        foam._read_text(ts[0][1] / args.field)
+        foam.check_format(ts[0][1] / args.field)
     if len(ts) < 3:
         raise CfdmlError(f"found {len(ts)} time folders with '{args.field}' in the time window; need at least 3",
                          hint="fields found: " + ", ".join(sorted(foam.field_names(case))))
@@ -138,7 +148,7 @@ def _case_snapshots(args):
     if gb > 4:
         print(f"  warning: this needs about {gb:.0f} GB of memory; use --every, --box or a shorter time window if it fails")
     print(f"  reading {args.field} from {len(ts)} time folders ({n_used} cells) ...")
-    snaps = [foam.read_field(d / args.field, nc) for _, d in ts]
+    snaps = [first] + [foam.read_field(d / args.field, nc) for _, d in ts[1:]]
     if sel is not None:
         snaps = [f[sel] for f in snaps]
     tt = np.array([t for t, _ in ts])
@@ -309,6 +319,8 @@ def cmd_fieldstats(args):
             raise CfdmlError("--box takes xmin,xmax,ymin,ymax,zmin,zmax")
         sel = np.all((C >= b[0::2]) & (C <= b[1::2]), 1)
     first = foam.read_field(ts[0][1] / args.field, nc)
+    if args.phase and first.ndim != 1:
+        raise CfdmlError(f"--phase needs a scalar field; {args.field} has {first.shape[1]} components")
     phase = first.ndim == 1 and (args.phase or (first.min() >= -1e-6 and first.max() <= 1 + 1e-6
                                                and args.field.lower().startswith("alpha")))
     graph = None
@@ -353,7 +365,8 @@ def cmd_fieldstats(args):
     for r in rows:
         for k in names:
             r.setdefault(k, float("nan"))
-    out = Path(args.out) if args.out else case / "postProcessing/cfdml_fieldstats"
+    from .report import claim
+    out = claim(args.out) if args.out else case / "postProcessing/cfdml_fieldstats"
     out.mkdir(parents=True, exist_ok=True)
     path = out / f"{args.field}.csv"
     with open(path, "w", newline="") as fh:
@@ -560,8 +573,8 @@ def cmd_predict(args):
               + "  ".join(f"{fmt(pred[n][0][i]):>11} +/- {fmt(2 * pred[n][1][i]):<8}" for n in names))
     if len(X) > 50:
         print(f"  ... {len(X) - 50} more rows in the CSV")
-    out = Path(args.out or "cfdml_predictions")
-    out.mkdir(parents=True, exist_ok=True)
+    from .report import claim
+    out = claim(args.out or "cfdml_predictions")
     with open(out / "predictions.csv", "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(M.inputs + [c for n in names for c in (n, f"{n}_2sigma")])
@@ -678,6 +691,9 @@ def cmd_steady(args):
     rep = _steady_core(args, t, data, cols, f"Is the run settled? {Path(args.file).name}", "cfdml_steady")
     if rep is not None:
         rep.close()
+        if any(v["verdict"] != "settled" for v in rep.stats.values()) or len(rep.stats) < len(cols):
+            args.exit_code = 3
+    return getattr(args, "exit_code", 0)
 
 
 def _steady_core(args, t, data, cols, title, out_default):
@@ -690,8 +706,16 @@ def _steady_core(args, t, data, cols, title, out_default):
     period = max(periods.values())
     never = [c for c, e in ends.items() if e is None]
     if never and args.after is None:
-        print(f"  {', '.join(never)} still changing at the end of the record (t = {fmt(t[-1])}): the run has not "
-              "settled; run longer (or give --after to force statistics)")
+        rep = Report(_out(args, out_default), title)
+        rep.say(f"{', '.join(never)} still changing at the end of the record (t = {fmt(t[-1])}): the run has not "
+                "settled; run longer (or give --after to force statistics)", summary=True)
+        fig, ax = plt.subplots(len(cols), 1, figsize=(9, 2.2 * len(cols)), squeeze=False)
+        for a, c in zip(ax[:, 0], cols):
+            a.plot(t, data[c], color=COLORS[0], lw=0.6); a.set_ylabel(c)
+        ax[-1, 0].set_xlabel("time")
+        rep.figure(fig, "steady")
+        rep.close()
+        args.exit_code = 3
         return None
     t0 = args.after if args.after is not None else max(ends.values())
     rep = Report(_out(args, out_default), title)
@@ -770,7 +794,7 @@ def _load_xy(path, x, y):
             if c not in names:
                 raise CfdmlError(f"no column '{c}' in {path}", hint="columns are: " + ", ".join(names))
         pts = [(float(r[x]), float(r[y])) for r in rows if r[x] not in ("", None) and r[y] not in ("", None)]
-        return np.array(pts).T
+        return np.array(pts, float).reshape(-1, 2).T
     tb = read_table(path)
     return tb[x], tb[y]
 
@@ -785,6 +809,8 @@ def cmd_compare(args):
         raise CfdmlError("give a results file with -x and -y", hint="e.g.  cfdml compare runs.csv -x Re -y St --ref "
                          "cylinder-st-williamson   (cfdml compare --list shows built-in references)")
     X, Y = _load_xy(args.file, args.x, args.y)
+    if len(X) == 0:
+        raise CfdmlError(f"no rows with both {args.x} and {args.y} in {args.file}")
     o = np.argsort(X); X, Y = X[o], Y[o]
     if args.ref:
         if args.ref not in REFERENCES:
@@ -796,18 +822,26 @@ def cmd_compare(args):
         refx, refy = gx, ref(gx)
     elif args.ref_file:
         rx, ry = _load_xy(args.ref_file, args.ref_x or args.x, args.ref_y or args.y)
+        if len(rx) == 0:
+            raise CfdmlError(f"no usable rows in {args.ref_file}")
         o = np.argsort(rx); rx, ry = rx[o], ry[o]
         lo, hi, cite = rx.min(), rx.max(), str(args.ref_file)
         ref = lambda x: np.interp(x, rx, ry)
         refx, refy = rx, ry
     else:
         raise CfdmlError("give --ref NAME or --ref-file FILE", hint="cfdml compare --list shows built-in references")
-    inside = (X >= lo) & (X <= hi)
+    with np.errstate(all="ignore"):
+        refv = ref(X)
+    zero = np.abs(refv) < 1e-12 * max(np.abs(refv).max(), 1e-300)
+    inside = (X >= lo) & (X <= hi) & np.isfinite(Y) & ~zero
     rep = Report(_out(args, f"cfdml_compare_{args.y}"), f"{args.y} vs {args.x} against {args.ref or Path(args.ref_file).name}")
     rep.say(f"reference: {cite}")
-    err = 100 * (Y - ref(X)) / ref(X)
-    rows = [[fmt(x), fmt(y, 5), fmt(float(ref(x)), 5) if i else "outside range", f"{e:+.2f}%" if i else "-"]
-            for x, y, e, i in zip(X, Y, err, inside)]
+    with np.errstate(all="ignore"):
+        err = np.where(inside, 100 * (Y - refv) / np.where(zero, 1, refv), np.nan)
+    rows = [[fmt(x), fmt(y, 5), "0 (no % error)" if z else (fmt(float(r), 5) if i else "outside range"),
+             f"{e:+.2f}%" if i else "-"] for x, y, r, e, i, z in zip(X, Y, refv, err, inside, zero)]
+    if zero.any():
+        rep.say(f"{zero.sum()} points where the reference is 0 have no % error and were left out of the summary")
     rep.table([args.x, f"{args.y} (yours)", f"{args.y} (reference)", "error"], rows)
     if inside.any():
         e = err[inside]
@@ -820,8 +854,8 @@ def cmd_compare(args):
         if abs(np.mean(e)) > 0.7 * np.mean(np.abs(e)) and inside.sum() > 3:
             rep.say("the errors share one sign: a systematic offset (e.g. blockage, domain size, mesh or time step) "
                     "rather than scatter", summary=True)
-    if (~inside).any():
-        rep.say(f"{(~inside).sum()} points outside the reference range were not compared", summary=True)
+    if (~inside & ~zero).any():
+        rep.say(f"{(~inside & ~zero).sum()} points outside the reference range (or missing) were not compared", summary=True)
     fig, ax = plt.subplots(1, 2, figsize=(9.5, 3.2))
     ax[0].plot(refx, refy, color="k", lw=1.2, label="reference")
     ax[0].plot(X, Y, "o", ms=4, color=COLORS[0], label="yours")
@@ -958,8 +992,8 @@ def cmd_forces(args):
     if "pressure_x" in F:
         data[names[0] + "_pressure"] = F[f"pressure_{d}"] / q
         data[names[0] + "_viscous"] = F[f"viscous_{d}"] / q
-    out = _out(args, "cfdml_forces")
-    Path(out).mkdir(parents=True, exist_ok=True)
+    from .report import claim
+    out = claim(_out(args, "cfdml_forces"))
     with open(Path(out) / "forces.csv", "w", newline="") as fh:
         w = csv.writer(fh); w.writerow(["time"] + list(data))
         w.writerows(zip(t, *data.values()))
@@ -968,7 +1002,7 @@ def cmd_forces(args):
         print("  give --rho, -U and --area to get coefficients (Cd, Cl) instead of forces")
     rep = _steady_core(args, t, data, list(names), f"Forces: {Path(src).name}", "cfdml_forces")
     if rep is None:
-        return
+        return getattr(args, "exit_code", 0)
     k = t >= rep.t0
     if names[0] + "_pressure" in data and rep.stats.get(names[0]):
         mp, mv = data[names[0] + "_pressure"][k].mean(), data[names[0] + "_viscous"][k].mean()
