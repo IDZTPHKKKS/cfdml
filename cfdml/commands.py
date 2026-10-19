@@ -429,6 +429,9 @@ def cmd_sweep(args):
     cfg = load_config(args.config)
     inputs, rows = collect(cfg)
     log_inputs = cfg.get("log_inputs") or []
+    bad = [k for k in log_inputs if k not in inputs]
+    if bad:
+        raise CfdmlError(f"log_inputs {bad} are not among the inputs {inputs}", hint="names are case sensitive")
     print(f"  {len(rows)} runs, inputs {inputs}")
     M = SweepModel(inputs, log_inputs, rows)
     outs = sorted({k for r in rows for k in r["y"]})
@@ -439,9 +442,15 @@ def cmd_sweep(args):
         for r in rows:
             w.writerow([r["name"]] + [r["x"][k] for k in inputs] + [r["y"].get(o, "") for o in outs])
     rep.say("all collected values: `runs.csv`")
-    for o in outs:
+    for o in list(outs):
         print(f"  fitting {o} ...")
-        M.fit_scalar(o)
+        try:
+            M.fit_scalar(o)
+        except CfdmlError as e:
+            print(f"  warning: {o} left out: {e}")
+            outs.remove(o)
+    if not outs and not cfg.get("fields"):
+        raise CfdmlError("no output could be fitted", hint="each output needs values from at least 3 runs")
     fields = cfg.get("fields") or {}
     for name, spec in fields.items():
         spec = spec or {}
@@ -526,7 +535,10 @@ def cmd_predict(args):
         for g in args.grid:
             k, rng = g.split("=")
             lo, hi, n = rng.split(":")
-            axes[k] = np.linspace(float(lo), float(hi), int(n))
+            if k in M.inputs and M.scaler.log[M.inputs.index(k)] and float(lo) > 0:
+                axes[k] = np.geomspace(float(lo), float(hi), int(n))
+            else:
+                axes[k] = np.linspace(float(lo), float(hi), int(n))
         if set(axes) != set(M.inputs):
             missing = [k for k in M.inputs if k not in axes]
             raise CfdmlError(f"--grid needs every input; missing {missing}", hint="fix one with e.g. --grid angle=5:5:1")
@@ -1018,19 +1030,24 @@ def cmd_average(args):
             raise CfdmlError(f"found {len(ts)} time folders with '{field}' in the window; need at least 2",
                              hint="fields found: " + ", ".join(sorted(foam.field_names(case))))
         print(f"  averaging {field} over {len(ts)} time folders ...")
-        n, mean, m2, half = 0, None, None, None
-        for i, (_, d) in enumerate(ts):
+        from .verify import time_weights
+        wts = time_weights(np.array([t for t, _ in ts]))
+        W, W2, mean, m2, half = 0.0, 0.0, None, None, None
+        for i, ((_, d), w) in enumerate(zip(ts, wts)):
             x = foam.read_field(d / field, nc)
             x = x.reshape(nc, -1)
             if mean is None:
                 mean = np.zeros_like(x); m2 = np.zeros((nc, x.shape[1], x.shape[1]))
-            n += 1
+            W += w; W2 += w * w
             delta = x - mean
-            mean += delta / n
-            m2 += delta[:, :, None] * (x - mean)[:, None, :]
+            mean += (w / W) * delta
+            m2 += w * delta[:, :, None] * (x - mean)[:, None, :]
             if i == len(ts) // 2 - 1:
                 half = mean.copy()
-        cov = m2 / max(n - 1, 1)
+        cov = m2 / max(W - W2 / W, 1e-300)
+        if np.ptp(np.diff([t for t, _ in ts])) > 0.01 * np.median(np.diff([t for t, _ in ts])):
+            rep.say(f"  {field}: time folders are unevenly spaced; each snapshot is weighted by its share of the "
+                    "time window", summary=True)
         k = mean.shape[1]
         mfield = mean[:, 0] if k == 1 else mean
         if k == 1:

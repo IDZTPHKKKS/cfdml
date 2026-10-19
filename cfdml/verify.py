@@ -88,3 +88,12 @@ REFERENCES = {
         x="Re", y="St", lo=47, hi=180, f=lambda re: 0.2684 - 1.0356 / np.sqrt(re),
         cite="Fey, Konig & Eckelmann (1998), Phys. Fluids 10, 1547: 47 < Re < 180"),
 }
+
+
+def time_weights(t):
+    t = np.asarray(t, float)
+    if len(t) < 2:
+        return np.ones(len(t))
+    d = np.diff(t)
+    w = np.r_[d[0], d]
+    return w / w.mean() if w.sum() > 0 else np.ones(len(t))

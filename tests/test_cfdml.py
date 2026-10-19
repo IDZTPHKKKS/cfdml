@@ -325,3 +325,21 @@ def test_model_pickle_is_restricted(tmp_path):
     with pytest.raises(CfdmlError):
         load_model(tmp_path / "evil.pkl")
     assert not (tmp_path / "ran").exists()
+
+
+def test_sweep_robustness(demo, tmp_path, capsys):
+    from cfdml.verify import time_weights
+    assert np.allclose(time_weights([0, 1, 2, 3]), 1) and np.allclose(time_weights([0, 1, 1.5, 2]), np.array([1, 1, 0.5, 0.5]) / 0.75)
+    lines = (demo / "sweep.yaml").read_text().split("\n")
+    runs = [i for i, ln in enumerate(lines) if ln.strip().startswith("- {case")]
+    for i in runs[:2]:
+        lines[i] = lines[i].replace("}", ", Cm: 0.1}")
+    cfg = "\n".join(lines)
+    (demo / "s2.yaml").write_text(cfg)
+    assert main(["sweep", str(demo / "s2.yaml"), "-o", str(tmp_path / "w")]) == 0
+    assert "Cm left out" in capsys.readouterr().out
+    (demo / "s3.yaml").write_text(cfg.replace("log_inputs: [Re]", "log_inputs: [re]"))
+    assert main(["sweep", str(demo / "s3.yaml"), "-o", str(tmp_path / "w3")]) == 1
+    assert main(["predict", str(tmp_path / "w"), "--grid", "Re=100:1000:3", "--grid", "angle=0:0:1",
+                 "-o", str(tmp_path / "p")]) == 0
+    assert "316.2" in (tmp_path / "p/predictions.csv").read_text()

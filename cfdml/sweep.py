@@ -263,8 +263,11 @@ class SweepModel:
         picks = []
         for _ in range(n):
             i = int(np.argmax(score))
+            if score[i] <= 0:
+                break
             picks.append((Xc[i], float(score[i] / max(len(self.scalar), 1))))
-            score -= score[i] * np.exp(-np.sum((Z - Z[i]) ** 2, 1) / 0.1)
+            score *= 1 - np.exp(-np.sum((Z - Z[i]) ** 2, 1) / 0.1)
+            score[np.sum((Z - Z[i]) ** 2, 1) < 0.05 ** 2] = 0
         return picks
 
     def save(self, path):
@@ -330,7 +333,9 @@ def _run_field(case, name, time, after):
         ts = [(t, d) for t, d in foam.times(case, [name]) if t >= float(after)]
         if not ts:
             raise CfdmlError(f"{case}: no '{name}' at or after time {after}")
-        return np.mean([foam.read_field(d / name, nc) for _, d in ts], 0)
+        from .verify import time_weights
+        w = time_weights([t for t, _ in ts])
+        return sum(wi * foam.read_field(d / name, nc) for wi, (_, d) in zip(w, ts)) / w.sum()
     return foam.read_field(_field_file(case, name, time), nc)
 
 
