@@ -364,3 +364,13 @@ def test_cli_fixes(demo, tmp_path, capsys):
     assert main(["spectrum", str(o / "g.csv"), "-o", str(o / "s")]) == 1
     assert main(["spectrum", str(o / "g.csv"), "-o", str(o / "s"), "--overwrite"]) == 0
     assert main(["fieldstats", str(demo / "wake"), "-f", "U", "--phase", "-o", str(o / "fs")]) == 1
+
+
+def test_foam_edge_cases(tmp_path):
+    foam.write_field(tmp_path / "U2", "U", np.ones((4, 2)), HDR)
+    assert foam.read_field(tmp_path / "U2").shape == (4, 3)
+    (tmp_path / "c/system").mkdir(parents=True)
+    (tmp_path / "c/constant/polyMesh").mkdir(parents=True)
+    (tmp_path / "c/constant/polyMesh/owner").write_text("FoamFile { format ascii; }\n0\n(\n)\n")
+    with pytest.raises(CfdmlError):
+        foam.n_cells(tmp_path / "c")

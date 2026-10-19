@@ -28,7 +28,8 @@ OpenFOAM cases, `postProcessing` files, CSVs and VTK files.
 
 ## Install
 
-Python 3.8+.
+Python 3.8+ (3.8 is past end of life, but it is still what many lab and cluster machines run, so it stays supported
+and tested).
 
 ```bash
 pip install git+https://github.com/IDZTPHKKKS/cfdml.git
@@ -48,6 +49,11 @@ cfdml predict demo/cfdml_sweep/model.pkl --at Re=350,angle=4
 ```
 
 Each command prints a short summary and writes plots and a `report.md` to an output folder (`-o` to choose it).
+A folder that already holds other files is not written into unless you add `--overwrite`.
+
+Exit codes: 0 done, 1 error in the input (with a hint), 2 unexpected error (rerun with `--debug`), 3 `steady` /
+`forces`: the run has not settled. Model files from `cfdml sweep` are loaded with an allowlist, but only use model
+files you trust.
 
 ## Notes on input
 
