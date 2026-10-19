@@ -279,8 +279,16 @@ def load_model(path):
         path = path / "model.pkl"
     if not path.exists():
         raise CfdmlError(f"model not found: {path}", hint="train one first with:  cfdml sweep <config.yaml>")
-    with open(path, "rb") as fh:
-        return pickle.load(fh)
+    try:
+        with open(path, "rb") as fh:
+            m = pickle.load(fh)
+    except Exception as e:
+        raise CfdmlError(f"could not load {path}: {type(e).__name__}: {e}",
+                         hint="models are tied to the Python / scikit-learn versions they were made with; "
+                              "rerun  cfdml sweep  on this machine")
+    if not isinstance(m, SweepModel):
+        raise CfdmlError(f"{path} is not a cfdml sweep model")
+    return m
 
 
 def _field_file(case, name, time):
