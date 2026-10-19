@@ -627,9 +627,11 @@ def cmd_gci(args):
             f"+/- {fmt(R['gci21'] * abs(R['phi'][0]), 3)}", summary=True)
     rep.say(f"GCI on the medium mesh = {100 * R['gci32']:.2f}%")
     a = R["asymptotic"]
-    rep.say(f"asymptotic range check GCI32 / (r^p GCI21) = {a:.3f} "
-            + ("(close to 1: in the asymptotic range)" if abs(a - 1) < 0.1 else
-               "(not close to 1: the meshes may not be in the asymptotic range; treat the GCI with care)"), summary=True)
+    sane = 0.5 <= R["p"] <= 4 and not R["oscillatory"]
+    if sane:
+        rep.say(f"asymptotic range check GCI32 / (r^p GCI21) = {a:.3f} "
+                + ("(close to 1: in the asymptotic range)" if abs(a - 1) < 0.1 else
+                   "(not close to 1: the meshes may not be in the asymptotic range; treat the GCI with care)"), summary=True)
     if R["oscillatory"]:
         rep.say("warning: the values oscillate with refinement (fine-medium and medium-coarse differences have "
                 "opposite signs); the GCI is less reliable", summary=True)

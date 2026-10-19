@@ -303,3 +303,11 @@ def test_truncated_and_quoted_tables(demo, tmp_path, capsys):
     (tmp_path / "q.csv").write_text('time,"Cd, mean",Cl\n0,1.0,0.1\n1,,0.2\n2,1.2,N/A\n')
     tb = read_table(tmp_path / "q.csv")
     assert tb.names == ["time", "Cd, mean", "Cl"] and np.isnan(tb["Cd, mean"][1]) and np.isnan(tb["Cl"][2])
+
+
+def test_gci_degenerate(tmp_path, capsys):
+    from cfdml.verify import gci
+    with pytest.raises(CfdmlError):
+        gci([1, 2, 4], [1.0, 1.1, 1.2])
+    assert main(["gci", "--h", "1,2,4", "--values", "6.063,5.972,5.863", "-o", str(tmp_path / "g")]) == 0
+    assert "asymptotic range" not in capsys.readouterr().out

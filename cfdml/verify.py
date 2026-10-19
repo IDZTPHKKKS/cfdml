@@ -18,13 +18,22 @@ def gci(h, phi, fs=1.25):
     if e21 == 0 or e32 == 0:
         raise CfdmlError("two meshes give the same value; the order of accuracy cannot be estimated")
     s = np.sign(e32 / e21)
-    p = 2.0
-    for _ in range(200):
-        q = np.log((r21 ** p - s) / (r32 ** p - s))
-        p_new = abs(np.log(abs(e32 / e21)) + q) / np.log(r21)
-        if abs(p_new - p) < 1e-10:
-            break
-        p = p_new
+    p, converged = 2.0, False
+    with np.errstate(all="ignore"):
+        for _ in range(500):
+            q = np.log((r21 ** p - s) / (r32 ** p - s))
+            p_new = abs(np.log(abs(e32 / e21)) + q) / np.log(r21)
+            if not np.isfinite(p_new):
+                break
+            if abs(p_new - p) < 1e-10:
+                p, converged = p_new, True
+                break
+            p = p_new
+    if not converged or p < 0.1 or r21 ** p - 1 < 1e-3:
+        raise CfdmlError("the observed order of accuracy could not be determined (the values do not converge with "
+                         "refinement, or change by the same amount between every pair of meshes)",
+                         hint="check that the three values come from systematically refined meshes and are themselves "
+                              "converged in time; a GCI is not meaningful here")
     ext = (r21 ** p * phi[0] - phi[1]) / (r21 ** p - 1)
     ea21 = abs((phi[0] - phi[1]) / phi[0])
     ea32 = abs((phi[1] - phi[2]) / phi[1])
