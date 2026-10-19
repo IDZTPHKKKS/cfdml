@@ -311,3 +311,17 @@ def test_gci_degenerate(tmp_path, capsys):
         gci([1, 2, 4], [1.0, 1.1, 1.2])
     assert main(["gci", "--h", "1,2,4", "--values", "6.063,5.972,5.863", "-o", str(tmp_path / "g")]) == 0
     assert "asymptotic range" not in capsys.readouterr().out
+
+
+def test_model_pickle_is_restricted(tmp_path):
+    import pickle
+    from cfdml.sweep import load_model
+
+    class Payload:
+        def __reduce__(self):
+            return (open, (str(tmp_path / "ran"), "w"))
+
+    (tmp_path / "evil.pkl").write_bytes(pickle.dumps(Payload()))
+    with pytest.raises(CfdmlError):
+        load_model(tmp_path / "evil.pkl")
+    assert not (tmp_path / "ran").exists()

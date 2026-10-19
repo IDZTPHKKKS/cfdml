@@ -272,6 +272,26 @@ class SweepModel:
             pickle.dump(self, fh)
 
 
+_ALLOWED = {
+    ("cfdml.sweep", "Scaler"), ("cfdml.sweep", "SweepModel"),
+    ("numpy", "dtype"), ("numpy", "ndarray"),
+    ("numpy.core.multiarray", "_reconstruct"), ("numpy.core.multiarray", "scalar"),
+    ("numpy._core.multiarray", "_reconstruct"), ("numpy._core.multiarray", "scalar"),
+    ("numpy.random._pickle", "__bit_generator_ctor"), ("numpy.random._pickle", "__randomstate_ctor"),
+    ("numpy.random._pickle", "__generator_ctor"), ("numpy.random._mt19937", "MT19937"),
+    ("pathlib", "PosixPath"), ("pathlib", "WindowsPath"), ("pathlib", "Path"),
+    ("sklearn.gaussian_process._gpr", "GaussianProcessRegressor"),
+}
+_KERNELS = {"ConstantKernel", "Matern", "Product", "Sum", "WhiteKernel", "RBF", "Hyperparameter"}
+
+
+class _ModelUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        if (module, name) in _ALLOWED or (module == "sklearn.gaussian_process.kernels" and name in _KERNELS):
+            return super().find_class(module, name)
+        raise pickle.UnpicklingError(f"refusing to load {module}.{name}")
+
+
 def load_model(path):
     path = Path(path)
     if path.is_dir():
@@ -280,7 +300,10 @@ def load_model(path):
         raise CfdmlError(f"model not found: {path}", hint="train one first with:  cfdml sweep <config.yaml>")
     try:
         with open(path, "rb") as fh:
-            m = pickle.load(fh)
+            m = _ModelUnpickler(fh).load()
+    except pickle.UnpicklingError as e:
+        raise CfdmlError(f"{path} is not a cfdml model or contains something other than model data ({e})",
+                         hint="only load models made by  cfdml sweep ; model files can run code if crafted")
     except Exception as e:
         raise CfdmlError(f"could not load {path}: {type(e).__name__}: {e}",
                          hint="models are tied to the Python / scikit-learn versions they were made with; "
