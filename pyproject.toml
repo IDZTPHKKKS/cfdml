@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cfdml"
+version = "0.1.0"
+description = "Analysis and machine-learning predictions for CFD results, from the command line"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+dependencies = ["numpy>=1.20", "scipy>=1.6", "matplotlib>=3.4", "scikit-learn>=1.0", "pyyaml>=5.1"]
+
+[project.optional-dependencies]
+vtk = ["meshio>=5"]
+test = ["pytest"]
+
+[project.scripts]
+cfdml = "cfdml.cli:main"
+
+[tool.setuptools]
+packages = ["cfdml"]
+
+[tool.setuptools.package-data]
+cfdml = ["templates/*.yaml"]

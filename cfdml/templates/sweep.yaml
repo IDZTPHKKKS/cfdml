@@ -1,0 +1,22 @@
+# cfdml sweep sweep.yaml   (paths relative to this file)
+
+inputs: [Re, voltage]
+log_inputs: [Re]
+
+# stat: mean | std | rms | min | max | final | amplitude | frequency | period
+outputs:
+  Nu: {file: postProcessing/wallHeatFlux/0/wallHeatFlux.dat, column: Nu, stat: mean, after: 50}
+  dp: {file: postProcessing/pressureDrop/0/fieldValue.dat, column: areaAverage(p), stat: mean, after: 50}
+  St: {file: postProcessing/forceCoeffs/0/coefficient.dat, column: Cl, stat: frequency, after: 50, scale: 1.0}
+
+# fields:
+#   U: {time: latest}
+#   T: {mean_after: 50}
+
+runs:
+  - {case: runs/Re200_V5, Re: 200, voltage: 5}
+  - {case: runs/Re500_V5, Re: 500, voltage: 5}
+  - {case: runs/Re1000_V10, Re: 1000, voltage: 10}
+  - {Re: 800, voltage: 0, Nu: 12.4, dp: 3.1}
+
+# table: runs.csv
