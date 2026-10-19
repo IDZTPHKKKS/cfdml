@@ -23,7 +23,9 @@ def _series(path, column, after=None, before=None):
     tb = read_table(path)
     col = column or tb.value_names[0]
     t, y = tb.time, tb[col]
-    m = np.ones(len(t), bool)
+    m = np.isfinite(t) & np.isfinite(y)
+    if (~m).any():
+        print(f"  note: skipped {(~m).sum()} rows with missing values in {col}")
     if after is not None:
         m &= t >= after
     if before is not None:
@@ -100,32 +102,62 @@ def cmd_spectrum(args):
     rep.close()
 
 
+def _check_case(case):
+    if case.is_dir() and any(case.glob("processor*")) and not any(foam._time_dirs(case)):
+        raise CfdmlError(f"{case} is decomposed (processor* folders) and has no reconstructed time folders",
+                         hint="run  reconstructPar  inside the case first")
+    if not foam.is_case(case):
+        raise CfdmlError(f"{case} does not look like an OpenFOAM case (no system/ folder)")
+
+
 def _case_snapshots(args):
     case = Path(args.case)
+    _check_case(case)
     if not foam.is_case(case):
         raise CfdmlError(f"{case} does not look like an OpenFOAM case (no system/ folder)")
     ts = foam.times(case, [args.field])
     ts = [(t, d) for t, d in ts if (args.after is None or t >= args.after) and (args.before is None or t <= args.before)]
     if args.every > 1:
         ts = ts[::args.every]
+    if ts:
+        foam._read_text(ts[0][1] / args.field)
     if len(ts) < 3:
         raise CfdmlError(f"found {len(ts)} time folders with '{args.field}' in the time window; need at least 3",
                          hint="fields found: " + ", ".join(sorted(foam.field_names(case))))
     nc = foam.n_cells(case)
-    print(f"  reading {args.field} from {len(ts)} time folders ({nc} cells) ...")
+    C, sel = None, None
+    if getattr(args, "box", None):
+        C = foam.cell_centres(case)
+        b = [float(v) for v in args.box.split(",")]
+        if len(b) != 6:
+            raise CfdmlError("--box takes xmin,xmax,ymin,ymax,zmin,zmax")
+        sel = np.nonzero(np.all((C >= b[0::2]) & (C <= b[1::2]), 1))[0]
+        if sel.size == 0:
+            raise CfdmlError("no cells inside --box", hint=f"the mesh spans {C.min(0).round(3)} to {C.max(0).round(3)}")
+    n_used = nc if sel is None else len(sel)
+    first = foam.read_field(ts[0][1] / args.field, nc)
+    k = 1 if first.ndim == 1 else first.shape[1]
+    gb = n_used * k * len(ts) * 8 * 4 / 1e9
+    if gb > 4:
+        print(f"  warning: this needs about {gb:.0f} GB of memory; use --every, --box or a shorter time window if it fails")
+    print(f"  reading {args.field} from {len(ts)} time folders ({n_used} cells) ...")
     snaps = [foam.read_field(d / args.field, nc) for _, d in ts]
+    if sel is not None:
+        snaps = [f[sel] for f in snaps]
     tt = np.array([t for t, _ in ts])
     dts = np.diff(tt)
     if np.ptp(dts) > 0.01 * np.median(dts):
         print("  note: the time folders are not equally spaced; DMD frequencies assume they are")
-    return case, tt, snaps, nc
+    return case, tt, snaps, nc, sel
 
 
-def _centres_2d(case):
+def _centres_2d(case, sel=None):
     try:
         C = foam.cell_centres(case)
     except CfdmlError:
         return None, None
+    if sel is not None:
+        C = C[sel]
     span = np.ptp(C, 0)
     a, b = np.argsort(span)[::-1][:2]
     return C, (a, b)
@@ -141,9 +173,12 @@ def _field_plot(ax, C, axes, values, title, cmap="RdBu_r", sym=True):
 
 
 def cmd_pod(args):
-    case, tt, snaps, nc = _case_snapshots(args)
+    case, tt, snaps, nc_all, sel = _case_snapshots(args)
+    nc = len(snaps[0])
     X, keep = snapshot_matrix(snaps)
     V = foam.cell_volumes(case)
+    if V is not None and sel is not None:
+        V = V[sel]
     w = np.repeat(V, len(keep)) if V is not None else None
     P = pod(X, weights=w)
     rep = Report(_out(args, f"cfdml_pod_{args.field}"), f"POD of {args.field} in {case.name}")
@@ -169,7 +204,7 @@ def cmd_pod(args):
         ax[1].plot(tt, P["coeff"][i], lw=0.9, color=COLORS[i], label=f"mode {i + 1}")
     ax[1].set_xlabel("time"); ax[1].set_title("time coefficients"); ax[1].legend(fontsize=7)
     rep.figure(fig, "pod_energy")
-    C, axes = _centres_2d(case)
+    C, axes = _centres_2d(case, sel)
     if C is not None:
         nk = len(keep)
         aspect = np.ptp(C[:, axes[1]]) / max(np.ptp(C[:, axes[0]]), 1e-30)
@@ -188,18 +223,22 @@ def cmd_pod(args):
         hdr = foam.field_header(foam.times(case, [args.field])[0][1] / args.field)
         for i in range(n):
             M = P["modes"][:, i].reshape(nc, len(keep))
-            full = np.zeros((nc, snaps[0].shape[1])) if snaps[0].ndim == 2 else None
-            if full is not None:
-                full[:, keep] = M
-            foam.write_field(rep.out / "foam_modes" / f"{i + 1}" / args.field, args.field,
-                             full if full is not None else M[:, 0], hdr, note=f"POD mode {i + 1}")
+            idx = np.arange(nc_all) if sel is None else sel
+            full = np.zeros((nc_all, snaps[0].shape[1])) if snaps[0].ndim == 2 else np.zeros(nc_all)
+            if full.ndim == 2:
+                full[np.ix_(idx, keep)] = M
+            else:
+                full[idx] = M[:, 0]
+            foam.write_field(rep.out / "foam_modes" / f"{i + 1}" / args.field, args.field, full, hdr,
+                             note=f"POD mode {i + 1}")
         rep.say(f"modes written as OpenFOAM fields in `foam_modes/<n>/{args.field}`: copy a folder into the case as a time "
                 "folder to view it in ParaView")
     rep.close()
 
 
 def cmd_dmd(args):
-    case, tt, snaps, nc = _case_snapshots(args)
+    case, tt, snaps, nc_all, sel = _case_snapshots(args)
+    nc = len(snaps[0])
     X, keep = snapshot_matrix(snaps)
     X = X - X.mean(1, keepdims=True)
     dt = float(np.median(np.diff(tt)))
@@ -233,7 +272,7 @@ def cmd_dmd(args):
     ax[1].stem(D["freq"][pos], D["amp"][pos] / D["amp"].max(), basefmt=" ")
     ax[1].set_xlabel("frequency"); ax[1].set_ylabel("relative amplitude"); ax[1].set_title("DMD spectrum")
     rep.figure(fig, "dmd_spectrum")
-    C, axes = _centres_2d(case)
+    C, axes = _centres_2d(case, sel)
     if C is not None and osc:
         i = int(np.nonzero(D["freq"] > 1e-9)[0][0])
         M = D["modes"][:, i].reshape(nc, len(keep))
@@ -250,8 +289,7 @@ def cmd_fieldstats(args):
     from scipy.sparse import coo_matrix
     from scipy.sparse.csgraph import connected_components
     case = Path(args.case)
-    if not foam.is_case(case):
-        raise CfdmlError(f"{case} does not look like an OpenFOAM case (no system/ folder)")
+    _check_case(case)
     ts = [(t, d) for t, d in foam.times(case, [args.field])
           if (args.after is None or t >= args.after) and (args.before is None or t <= args.before)]
     if not ts:
@@ -471,7 +509,7 @@ def cmd_sweep(args):
         rep.say("These conditions are inside your sweep range where the model is least sure. Running them improves "
                 "the model the most.")
         rep.table(inputs + ["relative uncertainty"], [[fmt(v) for v in x] + [fmt(s, 3)] for x, s in sug])
-        rep.say(f"next suggested run: " + ", ".join(f"{k}={fmt(v)}" for k, v in zip(inputs, sug[0][0])), summary=True)
+        rep.say("next suggested run: " + ", ".join(f"{k}={fmt(v)}" for k, v in zip(inputs, sug[0][0])), summary=True)
     M.save(rep.out / "model.pkl")
     rep.say(f"model saved: `model.pkl` (use  cfdml predict {rep.out}/model.pkl --at ...)")
     rep.close()
@@ -548,3 +586,227 @@ def cmd_init(args):
 def cmd_demo(args):
     from .demo import make_demo
     make_demo(Path(args.out))
+
+
+def cmd_gci(args):
+    from .verify import gci
+    name = args.name
+    if args.cases:
+        if len(args.cases) != 3 or not args.file:
+            raise CfdmlError("--cases needs three case folders and --file", hint="e.g. --cases fine medium coarse --file "
+                             "postProcessing/forceCoeffs/0/coefficient.dat -c Cd --after auto")
+        cells, vals = [], []
+        for c in args.cases:
+            from .sweep import _stat
+            tb = read_table(Path(c) / args.file)
+            col = args.column or tb.value_names[0]
+            name = name or col
+            vals.append(_stat(tb.time, tb[col], args.stat, "auto" if args.after is None else args.after))
+            cells.append(foam.n_cells(c))
+        h = np.array(cells, float) ** (-1 / args.dim)
+    else:
+        if not args.values or not (args.cells or args.h):
+            raise CfdmlError("give --values and --cells (or --h), or --cases",
+                             hint="e.g.  cfdml gci --cells 25000,100000,400000 --values 1.42,1.39,1.385")
+        vals = [float(v) for v in args.values.split(",")]
+        if args.h:
+            h = np.array([float(v) for v in args.h.split(",")])
+        else:
+            cells = [float(v) for v in args.cells.split(",")]
+            h = np.array(cells) ** (-1 / args.dim)
+    name = name or "value"
+    R = gci(h, vals)
+    rep = Report(_out(args, f"cfdml_gci_{name}"), f"Mesh convergence of {name}")
+    rep.say("Celik et al. (2008), J. Fluids Eng. 130, 078001; safety factor 1.25")
+    rep.table(["mesh", "h (relative)", name], [[lab, fmt(hh / R["h"][0], 4), fmt(v, 6)]
+                                               for lab, hh, v in zip(("fine", "medium", "coarse"), R["h"], R["phi"])])
+    rep.say(f"refinement ratios {R['r21']:.3f} (medium/fine), {R['r32']:.3f} (coarse/medium)")
+    rep.say(f"observed order of accuracy p = **{R['p']:.2f}**", summary=True)
+    rep.say(f"extrapolated (mesh-independent) {name} = **{fmt(R['ext'], 6)}**", summary=True)
+    rep.say(f"GCI on the fine mesh = **{100 * R['gci21']:.2f}%**, i.e. {name} = {fmt(R['phi'][0], 6)} "
+            f"+/- {fmt(R['gci21'] * abs(R['phi'][0]), 3)}", summary=True)
+    rep.say(f"GCI on the medium mesh = {100 * R['gci32']:.2f}%")
+    a = R["asymptotic"]
+    rep.say(f"asymptotic range check GCI32 / (r^p GCI21) = {a:.3f} "
+            + ("(close to 1: in the asymptotic range)" if abs(a - 1) < 0.1 else
+               "(not close to 1: the meshes may not be in the asymptotic range; treat the GCI with care)"), summary=True)
+    if R["oscillatory"]:
+        rep.say("warning: the values oscillate with refinement (fine-medium and medium-coarse differences have "
+                "opposite signs); the GCI is less reliable", summary=True)
+    if R["p"] > 4 or R["p"] < 0.5:
+        rep.say(f"warning: p = {R['p']:.2f} is far from the scheme's formal order; check the meshes and the "
+                "quantity (e.g. averaging window)", summary=True)
+    fig, ax = plt.subplots(figsize=(5, 3.2))
+    hh = np.r_[0, R["h"]] / R["h"][0]
+    ax.plot(R["h"] / R["h"][0], R["phi"], "o-", color=COLORS[0], label="meshes")
+    ax.errorbar([1], [R["phi"][0]], yerr=[R["gci21"] * abs(R["phi"][0])], color=COLORS[3], capsize=4, label="GCI (fine)")
+    ax.plot([0], [R["ext"]], "s", color="k", label="extrapolated")
+    g = np.linspace(0, hh[-1], 50)
+    ax.plot(g, R["ext"] + (R["phi"][0] - R["ext"]) * g ** R["p"], "--", color="#8c8c8c", lw=0.8)
+    ax.set_xlabel("h / h_fine"); ax.set_ylabel(name); ax.legend(fontsize=7)
+    rep.figure(fig, "gci")
+    rep.close()
+
+
+def cmd_steady(args):
+    from scipy import stats
+    from .verify import batch_means, transient_end
+    tb = read_table(args.file)
+    cols = args.column or [c for c in ("Cd", "Cl") if c in tb] or tb.value_names[:3]
+    t = tb.time
+    if len(t) < 100:
+        raise CfdmlError(f"the file has only {len(t)} samples, up to t = {fmt(t[-1])}", hint="did the run finish?")
+    ends, periods = {}, {}
+    ok = np.isfinite(t)
+    for c in cols:
+        ok &= np.isfinite(tb[c])
+    if (~ok).any():
+        print(f"  note: skipped {(~ok).sum()} rows with missing values")
+    t = t[ok]
+    data = {c: tb[c][ok] for c in cols}
+    for c in cols:
+        tu, yu, dt, _ = uniform(t, data[c])
+        ends[c], periods[c] = transient_end(tu, yu)
+    period = max(periods.values())
+    never = [c for c, e in ends.items() if e is None]
+    if never and args.after is None:
+        print(f"  {', '.join(never)} still changing at the end of the record (t = {fmt(t[-1])}): the run has not "
+              "settled; run longer (or give --after to force statistics)")
+        return
+    t0 = args.after if args.after is not None else max(ends.values())
+    rep = Report(_out(args, "cfdml_steady"), f"Is the run settled? {Path(args.file).name}")
+    span = t[-1] - t[0]
+    rep.say(f"record t = {fmt(t[0])} to {fmt(t[-1])}; " + (f"start-up transient ends at t = **{fmt(t0)}**"
+            if args.after is None else f"statistics from t = {fmt(t0)} (given)") +
+            f" ({100 * (t0 - t[0]) / span:.0f}% of the record)", summary=True)
+    if (t0 - t[0]) > 0.5 * span:
+        rep.say("the transient takes more than half of the record: run longer before trusting these statistics",
+                summary=True)
+    rows, verdicts = [], []
+    fig, ax = plt.subplots(len(cols), 1, figsize=(9, 2.2 * len(cols)), squeeze=False)
+    for a, c in zip(ax[:, 0], cols):
+        tu, yu, dt, _ = uniform(t, data[c])
+        k = tu >= t0
+        y = yu[k]
+        if len(y) < 40:
+            raise CfdmlError(f"only {len(y)} samples after t = {fmt(t0)}", hint="the run is too short; run longer")
+        m, se, nb = batch_means(y, 20, 2 * period)
+        if nb < 8:
+            rows.append([c, fmt(float(y.mean()), 5), "-", fmt(float(y.std()), 4), "-",
+                         "too few cycles after the transient for an error bar: run longer"])
+            rep.say(f"**{c}**: mean {fmt(float(y.mean()), 5)}, too few cycles after the transient for an error bar "
+                    f"({nb} independent batches, need 8): run longer", summary=True)
+            a.plot(tu, yu, color=COLORS[0], lw=0.6); a.axvspan(tu[0], t0, color="#c44e52", alpha=0.08, lw=0)
+            a.set_ylabel(c)
+            continue
+        ci = stats.t.ppf(0.975, nb - 1) * se
+        half = len(y) // 2
+        m1, se1, _ = batch_means(y[:half], 10, 2 * period)
+        m2, se2, _ = batch_means(y[half:], 10, 2 * period)
+        drift = abs(m2 - m1) / max(np.hypot(se1, se2), 1e-300)
+        sd = float(y.std())
+        a1, a2 = y[:half].std(), y[half:].std()
+        amp_change = (a2 - a1) / max(a1, 1e-300) if period > 1 and sd > 1e-5 + 1e-3 * abs(m) else 0.0
+        zero_mean = abs(m) < 0.1 * sd
+        rel = ci / abs(m) if not zero_mean else None
+        need = None
+        if rel is not None and rel > args.target:
+            need = (tu[-1] - t0) * ((rel / args.target) ** 2 - 1)
+        if abs(amp_change) > 0.05:
+            v = f"oscillation amplitude still {'growing' if amp_change > 0 else 'decaying'} ({100 * amp_change:+.0f}% between halves): run longer"
+        elif drift > 3:
+            v = "still drifting: run longer"
+        elif need:
+            v = f"settled, but the mean is only known to {100 * rel:.1f}%; about {fmt(need, 3)} more time units for {100 * args.target:g}%"
+        else:
+            v = "settled"
+        verdicts.append(v)
+        rows.append([c, fmt(m, 5), f"+/- {fmt(ci, 3)}" + (f" ({100 * rel:.2f}%)" if rel is not None else ""),
+                     fmt(sd, 4), f"{drift:.1f}", v])
+        rep.say(f"**{c}**: mean {fmt(m, 5)} +/- {fmt(ci, 3)} (95%), {v}", summary=True)
+        a.plot(tu, yu, color=COLORS[0], lw=0.6)
+        a.axvspan(tu[0], t0, color="#c44e52", alpha=0.08, lw=0)
+        a.axhline(m, color="k", lw=0.8); a.axhspan(m - ci, m + ci, color="k", alpha=0.12, lw=0)
+        a.set_ylabel(c)
+    ax[-1, 0].set_xlabel("time")
+    ax[0, 0].set_title("shaded red: start-up transient; grey band: 95% interval of the mean")
+    rep.table(["column", "mean", "95% interval", "std", "drift (sigma)", "verdict"], rows)
+    rep.say("Error bars from batch means (batches of at least two periods), so correlated samples are not counted "
+            "as independent. Drift compares the first and second half of the settled part.")
+    rep.figure(fig, "steady")
+    rep.close()
+
+
+def _load_xy(path, x, y):
+    with open(path, newline="") as fh:
+        sample = fh.read(4096)
+    if "," in sample and not sample.lstrip().startswith("#"):
+        with open(path, newline="") as fh:
+            rows = list(csv.DictReader(fh))
+        names = list(rows[0]) if rows else []
+        for c in (x, y):
+            if c not in names:
+                raise CfdmlError(f"no column '{c}' in {path}", hint="columns are: " + ", ".join(names))
+        pts = [(float(r[x]), float(r[y])) for r in rows if r[x] not in ("", None) and r[y] not in ("", None)]
+        return np.array(pts).T
+    tb = read_table(path)
+    return tb[x], tb[y]
+
+
+def cmd_compare(args):
+    from .verify import REFERENCES
+    if args.list:
+        for k, r in REFERENCES.items():
+            print(f"  {k:<26} {r['y']} vs {r['x']}: {r['cite']}")
+        return
+    if not args.file or not args.x or not args.y:
+        raise CfdmlError("give a results file with -x and -y", hint="e.g.  cfdml compare runs.csv -x Re -y St --ref "
+                         "cylinder-st-williamson   (cfdml compare --list shows built-in references)")
+    X, Y = _load_xy(args.file, args.x, args.y)
+    o = np.argsort(X); X, Y = X[o], Y[o]
+    if args.ref:
+        if args.ref not in REFERENCES:
+            raise CfdmlError(f"unknown reference '{args.ref}'", hint="built-in: " + ", ".join(REFERENCES))
+        R = REFERENCES[args.ref]
+        lo, hi, cite = R["lo"], R["hi"], R["cite"]
+        ref = lambda x: R["f"](x)
+        gx = np.linspace(max(lo, X.min() * 0.9), min(hi, X.max() * 1.1), 200)
+        refx, refy = gx, ref(gx)
+    elif args.ref_file:
+        rx, ry = _load_xy(args.ref_file, args.ref_x or args.x, args.ref_y or args.y)
+        o = np.argsort(rx); rx, ry = rx[o], ry[o]
+        lo, hi, cite = rx.min(), rx.max(), str(args.ref_file)
+        ref = lambda x: np.interp(x, rx, ry)
+        refx, refy = rx, ry
+    else:
+        raise CfdmlError("give --ref NAME or --ref-file FILE", hint="cfdml compare --list shows built-in references")
+    inside = (X >= lo) & (X <= hi)
+    rep = Report(_out(args, f"cfdml_compare_{args.y}"), f"{args.y} vs {args.x} against {args.ref or Path(args.ref_file).name}")
+    rep.say(f"reference: {cite}")
+    err = 100 * (Y - ref(X)) / ref(X)
+    rows = [[fmt(x), fmt(y, 5), fmt(float(ref(x)), 5) if i else "outside range", f"{e:+.2f}%" if i else "-"]
+            for x, y, e, i in zip(X, Y, err, inside)]
+    rep.table([args.x, f"{args.y} (yours)", f"{args.y} (reference)", "error"], rows)
+    if inside.any():
+        e = err[inside]
+        rep.say(f"{inside.sum()} points inside the reference range: mean |error| **{np.mean(np.abs(e)):.2f}%**, "
+                f"max {np.max(np.abs(e)):.2f}% at {args.x} = {fmt(X[inside][np.argmax(np.abs(e))])}; "
+                f"mean signed error {np.mean(e):+.2f}%", summary=True)
+        bad = X[inside][np.abs(e) > args.tol]
+        if bad.size:
+            rep.say(f"outside +/-{args.tol:g}%: {args.x} = " + ", ".join(fmt(b) for b in bad), summary=True)
+        if abs(np.mean(e)) > 0.7 * np.mean(np.abs(e)) and inside.sum() > 3:
+            rep.say("the errors share one sign: a systematic offset (e.g. blockage, domain size, mesh or time step) "
+                    "rather than scatter", summary=True)
+    if (~inside).any():
+        rep.say(f"{(~inside).sum()} points outside the reference range were not compared", summary=True)
+    fig, ax = plt.subplots(1, 2, figsize=(9.5, 3.2))
+    ax[0].plot(refx, refy, color="k", lw=1.2, label="reference")
+    ax[0].plot(X, Y, "o", ms=4, color=COLORS[0], label="yours")
+    ax[0].set_xlabel(args.x); ax[0].set_ylabel(args.y); ax[0].legend(fontsize=7)
+    ax[1].axhspan(-args.tol, args.tol, color="#55a868", alpha=0.12, lw=0)
+    ax[1].axhline(0, color="k", lw=0.8)
+    ax[1].plot(X[inside], err[inside], "o", ms=4, color=COLORS[0])
+    ax[1].set_xlabel(args.x); ax[1].set_ylabel("error %"); ax[1].set_title(f"band: +/-{args.tol:g}%")
+    rep.figure(fig, "compare")
+    rep.close()

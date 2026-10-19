@@ -183,9 +183,14 @@ def main():
                  "runs:"] + [f"  - {{case: {p}, Re: {re}}}" for re, p in runs if re >= 50]
         (d / "sweep.yaml").write_text("\n".join(lines) + "\n")
         run("sweep", d / "sweep.yaml", "-o", d / "sweep")
+        run("steady", forces / "Re-80/postProcessing/forceCoeffs/0/coefficient.dat", "-o", d / "steady")
+        (d / "auto.yaml").write_text((d / "sweep.yaml").read_text().replace("after: 120", "after: auto"))
+        run("sweep", d / "auto.yaml", "-o", d / "auto")
+        run("compare", d / "auto/runs.csv", "-x", "Re", "-y", "St", "--ref", "cylinder-st-williamson", "-o", d / "cmp")
         for src, dst in ((d / "spec/spectrum.png", "spectrum.png"), (d / "fc/forecast.png", "forecast.png"),
                          (d / "pod/pod_modes.png", "pod_modes.png"), (d / "dmd/dmd_mode.png", "dmd_mode.png"),
-                         (d / "sweep/sweep_St.png", "sweep_St.png"), (d / "sweep/sweep_Cd.png", "sweep_Cd.png")):
+                         (d / "sweep/sweep_St.png", "sweep_St.png"), (d / "steady/steady.png", "steady.png"),
+                         (d / "cmp/compare.png", "compare.png")):
             shutil.copy(src, IMG / dst)
         fig = overview(d, fields, forces, mesh)
         fig.savefig(IMG / "overview.png", dpi=170, bbox_inches="tight")

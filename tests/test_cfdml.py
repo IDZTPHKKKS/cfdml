@@ -122,3 +122,56 @@ def test_cli(demo, tmp_path, capsys):
     assert main(["init", "sweep", "-o", o + "/t.yaml"]) == 0
     assert main(["spectrum", o + "/missing.csv"]) == 1
     assert "not found" in capsys.readouterr().err
+
+
+def test_gci_celik_example():
+    from cfdml.verify import gci
+    r = gci(np.array([18000, 8000, 4500.0]) ** -0.5, [6.063, 5.972, 5.863])
+    assert abs(r["p"] - 1.53) < 0.01 and abs(r["ext"] - 6.1685) < 1e-3 and abs(r["gci21"] - 0.022) < 1e-3
+
+
+def test_transient_end():
+    from cfdml.verify import transient_end
+    t = np.arange(0, 200, 0.05)
+    amp = 1 / (1 + np.exp(-(t - 60) / 5))
+    te, _ = transient_end(t, amp * np.sin(2 * np.pi * 0.2 * t))
+    assert 70 < te < 110
+    te, _ = transient_end(t, np.exp(t / 40) * np.sin(2 * np.pi * 0.2 * t))
+    assert te is None
+
+
+def test_compare_and_steady(demo, tmp_path, capsys):
+    from cfdml.verify import REFERENCES
+    re = np.array([60, 80, 100, 150])
+    st = REFERENCES["cylinder-st-williamson"]["f"](re) * 1.02
+    (tmp_path / "r.csv").write_text("name,Re,St\n" + "".join(f"r{i},{a},{b}\n" for i, (a, b) in enumerate(zip(re, st))))
+    assert main(["compare", str(tmp_path / "r.csv"), "-x", "Re", "-y", "St", "--ref", "cylinder-st-williamson",
+                 "-o", str(tmp_path / "c")]) == 0
+    assert "+2.00%" in (tmp_path / "c/report.md").read_text()
+    t = np.arange(0, 300, 0.05)
+    cl = (1 - np.exp(-t / 10)) * np.sin(2 * np.pi * 0.2 * t)
+    cd = 1.3 + 0.2 * np.exp(-t / 10) + 0.02 * (1 - np.exp(-t / 10)) * np.sin(4 * np.pi * 0.2 * t)
+    (tmp_path / "f.csv").write_text("time,Cd,Cl\n" + "".join(f"{a},{b},{c}\n" for a, b, c in zip(t, cd, cl)))
+    capsys.readouterr()
+    assert main(["steady", str(tmp_path / "f.csv"), "-o", str(tmp_path / "s")]) == 0
+    out = capsys.readouterr().out
+    assert out.count("settled") == 2 and "run longer" not in out
+    assert main(["steady", str(demo / "wake/postProcessing/forceCoeffs/0/coefficient.dat"), "-o", str(tmp_path / "s2")]) == 0
+    assert main(["gci", "--cells", "4500,8000,18000", "--values", "5.863,5.972,6.063", "-o", str(tmp_path / "g")]) == 0
+
+
+def test_box(demo, tmp_path):
+    assert main(["pod", str(demo / "wake"), "--after", "20", "--box", "3,12,-2,2,-1,1", "--write-modes",
+                 "-o", str(tmp_path / "p")]) == 0
+    F = foam.read_field(tmp_path / "p/foam_modes/1/U")
+    C = foam.cell_centres(demo / "wake")
+    inside = (C[:, 0] >= 3) & (C[:, 0] <= 12) & (np.abs(C[:, 1]) <= 2)
+    assert np.all(F[~inside] == 0) and np.abs(F[inside]).sum() > 0
+
+
+@pytest.mark.parametrize("cmd", [[], ["info"], ["spectrum"], ["pod"], ["dmd"], ["fieldstats"], ["forecast"], ["steady"],
+                                 ["gci"], ["compare"], ["sweep"], ["predict"], ["init"], ["demo"]])
+def test_help(cmd, capsys):
+    with pytest.raises(SystemExit) as e:
+        main(cmd + ["--help"])
+    assert e.value.code == 0 and "usage" in capsys.readouterr().out

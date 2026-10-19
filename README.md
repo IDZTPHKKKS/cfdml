@@ -17,6 +17,9 @@ OpenFOAM cases, `postProcessing` files, CSVs and VTK files.
 | `cfdml forecast` | fits a signal's history and predicts ahead, scored against repeating the last cycle |
 | `cfdml sweep` | Gaussian-process surrogates over a set of runs, leave-one-out error, suggested next runs |
 | `cfdml predict` | outputs and fields at new conditions from a sweep model |
+| `cfdml steady` | detects the start-up transient, means with 95% intervals, drift, how much longer to run |
+| `cfdml gci` | mesh convergence: observed order, extrapolated value, Grid Convergence Index |
+| `cfdml compare` | % error against built-in reference correlations or your own data |
 
 ## Install
 
@@ -54,11 +57,26 @@ Each command prints a short summary and writes plots and a `report.md` to an out
 ```bash
 cfdml spectrum case/postProcessing/forceCoeffs/0/coefficient.dat -c Cl --after 0.5 -L 0.1 -U 2
 cfdml pod case -f U --after 0.5 --every 2 --write-modes
-cfdml dmd case -f p --after 0.5
+cfdml dmd case -f p --after 0.5 --box 0,0.5,-0.1,0.1,-1,1
 cfdml fieldstats case -f alpha.water --after 0.1
 cfdml fieldstats case -f T --box 0,0.02,0,0.002,-1,1
 cfdml forecast case/postProcessing/forceCoeffs/0/coefficient.dat -c Cl --after 0.5 --train 0.7
 ```
+
+## Verification
+
+```bash
+cfdml steady case/postProcessing/forceCoeffs/0/coefficient.dat
+cfdml gci --cells 25000,100000,400000 --values 1.42,1.39,1.385 --name Cd
+cfdml gci --cases coarse medium fine --file postProcessing/forceCoeffs/0/coefficient.dat -c Cd
+cfdml compare cfdml_sweep/runs.csv -x Re -y St --ref cylinder-st-williamson
+cfdml compare results.csv -x Re -y Nu --ref-file experiment.csv
+cfdml compare --list
+```
+
+`steady` finds where the per-cycle mean and amplitude stop changing, then gives batch-means confidence
+intervals (batches of at least two periods) and flags drift or a growing amplitude. `gci` follows Celik et al.
+(2008), J. Fluids Eng. 130, 078001. In a sweep config, `after: auto` uses the same transient detection.
 
 ## Sweeps
 
@@ -93,6 +111,14 @@ POD and DMD of a rounded square cylinder at 30 degrees, Re 136:
 ![pod](docs/images/pod_modes.png)
 
 ![dmd](docs/images/dmd_mode.png)
+
+`cfdml steady` on the Re 80 run: shedding only saturates at t = 160, so it asks for a longer run:
+
+![steady](docs/images/steady.png)
+
+`cfdml compare` against Williamson (1988), using `after: auto` (runs that never settled are left out):
+
+![compare](docs/images/compare.png)
 
 Lift forecast:
 

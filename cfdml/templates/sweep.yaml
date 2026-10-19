@@ -3,7 +3,7 @@
 inputs: [Re, voltage]
 log_inputs: [Re]
 
-# stat: mean | std | rms | min | max | final | amplitude | frequency | period
+# stat: mean | std | rms | min | max | final | amplitude | frequency | period;  after: a time or auto
 outputs:
   Nu: {file: postProcessing/wallHeatFlux/0/wallHeatFlux.dat, column: Nu, stat: mean, after: 50}
   dp: {file: postProcessing/pressureDrop/0/fieldValue.dat, column: areaAverage(p), stat: mean, after: 50}

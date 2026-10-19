@@ -8,6 +8,8 @@ def spectrum(y, dt, segments=4):
     y = np.asarray(y, float) - np.mean(y)
     if len(y) < 16:
         raise CfdmlError(f"only {len(y)} samples; a spectrum needs at least 16")
+    if not np.any(y):
+        raise CfdmlError("the signal is constant, so it has no frequency")
     nper = max(16, len(y) // segments)
     f, P = signal.welch(y, fs=1 / dt, nperseg=nper, noverlap=nper // 2)
     pad = 1 << int(np.ceil(np.log2(len(y) * 8)))

@@ -14,6 +14,10 @@ from .analysis import pod, rank_for, spectrum
 from .errors import CfdmlError
 from .table import read_table, uniform
 
+class NotSettled(CfdmlError):
+    pass
+
+
 STATS = ("mean", "std", "rms", "min", "max", "final", "amplitude", "frequency", "period")
 
 
@@ -32,6 +36,14 @@ def load_config(path):
 
 
 def _stat(t, y, stat, after=None, before=None):
+    if after == "auto":
+        from .verify import transient_end
+        tu, yu, _, _ = uniform(t, y)
+        after, _ = transient_end(tu, yu)
+        if after is None:
+            raise NotSettled(f"still changing at the end of the record (t = {t[-1]:g})")
+    elif after is not None:
+        after = float(after)
     m = np.ones(len(t), bool)
     if after is not None:
         m &= t >= after
@@ -93,6 +105,12 @@ def collect(cfg):
                 raise CfdmlError(f"run '{name}': output '{oname}' reads a file, but the run has no 'case:'")
             try:
                 tb = read_table(row["case"] / spec["file"])
+                if spec.get("after") == "auto":
+                    try:
+                        _stat(tb.time, tb[spec.get("column", tb.value_names[0])], spec.get("stat", "mean"), "auto")
+                    except NotSettled as e:
+                        print(f"  warning: run '{name}', output '{oname}' {e}; left out of the fit")
+                        continue
                 v = _stat(tb.time, tb[spec.get("column", tb.value_names[0])], spec.get("stat", "mean"),
                           spec.get("after"), spec.get("before"))
             except CfdmlError as e:

@@ -13,7 +13,10 @@ examples:
   cfdml dmd demo/wake -f U
   cfdml fieldstats demo/drops -f alpha.water          droplet volume, centroid and count over time
   cfdml forecast demo/wake/postProcessing/probes/0/U -c probe1_y --train 0.6 --horizon 20
-  cfdml init sweep                                  write a commented sweep config to fill in
+  cfdml steady demo/wake/postProcessing/forceCoeffs/0/coefficient.dat
+  cfdml gci --cells 25000,100000,400000 --values 1.42,1.39,1.385 --name Cd
+  cfdml compare runs.csv -x Re -y St --ref cylinder-st-williamson
+  cfdml init sweep                                  write a sweep config to fill in
   cfdml sweep demo/sweep.yaml                       learn outputs from a set of runs
   cfdml predict demo/cfdml_sweep/model.pkl --at Re=350,angle=4
 """
@@ -27,7 +30,7 @@ def build():
     sub = ap.add_subparsers(dest="cmd", metavar="command")
 
     def p(name, help_, fn):
-        s = sub.add_parser(name, help=help_, description=help_)
+        s = sub.add_parser(name, help=help_.replace("%", "%%"), description=help_)
         s.set_defaults(fn=fn)
         s.add_argument("-o", "--out", help="output folder (default: cfdml_<command>_... in the current folder)")
         return s
@@ -54,6 +57,7 @@ def build():
         s.add_argument("-f", "--field", default="U", help="field name (default U)")
         window(s)
         s.add_argument("--every", type=int, default=1, help="use every n-th time folder")
+        s.add_argument("--box", help="only cells inside xmin,xmax,ymin,ymax,zmin,zmax")
         if name == "pod":
             s.add_argument("--modes", type=int, default=4, help="modes to plot and save (default 4)")
             s.add_argument("--write-modes", action="store_true", help="also write the modes as OpenFOAM fields")
@@ -84,6 +88,32 @@ def build():
     s.add_argument("--at", action="append", help="a point, e.g. Re=350,angle=5 (repeat for more)")
     s.add_argument("--grid", action="append", help="a range per input, e.g. Re=100:1000:10 (start:stop:count)")
     s.add_argument("--max-fields", type=int, default=5, help="write predicted fields for at most this many points")
+
+    s = p("steady", "has the run settled? transient end, means with 95% error bars, drift, how much longer to run",
+          C.cmd_steady)
+    s.add_argument("file"); s.add_argument("-c", "--column", action="append", help="column (repeat; default Cd and Cl)")
+    s.add_argument("--after", type=float, help="use this start time instead of detecting the transient")
+    s.add_argument("--target", type=float, default=0.01, help="wanted relative precision of the means (default 0.01)")
+
+    s = p("gci", "mesh convergence: observed order, extrapolated value and Grid Convergence Index (3 meshes)", C.cmd_gci)
+    s.add_argument("--values", help="value on each mesh, e.g. 1.385,1.39,1.42")
+    s.add_argument("--cells", help="cell counts of the meshes, e.g. 400000,100000,25000")
+    s.add_argument("--h", help="mesh sizes instead of cell counts")
+    s.add_argument("--dim", type=int, default=2, help="2 or 3, for h = cells^(-1/dim) (default 2)")
+    s.add_argument("--name", help="name of the quantity, for the report")
+    s.add_argument("--cases", nargs="+", help="three case folders; values read from --file, cells from the mesh")
+    s.add_argument("--file", help="file inside each case, e.g. postProcessing/forceCoeffs/0/coefficient.dat")
+    s.add_argument("-c", "--column"); s.add_argument("--stat", default="mean")
+    s.add_argument("--after", help="start time for the statistic, or auto (default)")
+
+    s = p("compare", "compare results with a built-in reference or experimental data, with % errors", C.cmd_compare)
+    s.add_argument("file", nargs="?", help="your results: CSV or table with the x and y columns (e.g. runs.csv)")
+    s.add_argument("-x"); s.add_argument("-y")
+    s.add_argument("--ref", help="built-in reference (see --list)")
+    s.add_argument("--ref-file", help="reference data file (CSV / table)")
+    s.add_argument("--ref-x"); s.add_argument("--ref-y")
+    s.add_argument("--tol", type=float, default=5.0, help="tolerance band in %% (default 5)")
+    s.add_argument("--list", action="store_true", help="list the built-in references")
 
     s = p("init", "write a commented template config", C.cmd_init)
     s.add_argument("kind", choices=["sweep"]); s.add_argument("--force", action="store_true")

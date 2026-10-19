@@ -55,7 +55,7 @@ def make_wake_case(case, nx=60, ny=20, t_end=40.0, write_every=0.5, f=0.2, seed=
         U[:, :2] += 0.005 * rng.standard_normal((len(X), 2))
         _write(case, f"{t:g}", "U", U)
         _write(case, f"{t:g}", "p", p)
-    ts = np.arange(0, t_end + 1e-9, 0.05)
+    ts = np.arange(0, 3 * t_end + 1e-9, 0.05)
     probes = [(5.0, 0.5), (8.0, 0.0), (11.0, -0.5)]
     d = Path(case) / "postProcessing/probes/0"
     d.mkdir(parents=True, exist_ok=True)
