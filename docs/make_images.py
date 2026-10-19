@@ -25,7 +25,9 @@ GALLERY = [("lab/sq_re-136_angle-30_rD-0p1", "square, rounded corners, 30°, Re 
 
 
 def run(*args):
-    subprocess.run([sys.executable, "-m", "cfdml", *map(str, args)], check=True, cwd=ROOT, stdout=subprocess.DEVNULL)
+    r = subprocess.run([sys.executable, "-m", "cfdml", *map(str, args), "--overwrite"], cwd=ROOT, stdout=subprocess.DEVNULL)
+    if r.returncode not in (0, 3):
+        raise SystemExit(f"cfdml {args[0]} failed")
 
 
 def load(path):
